@@ -1,0 +1,161 @@
+{
+ "xefp4_version": "1.0",
+ "fmt": "xe8",
+ "G": 32,
+ "cases": {
+  "gauss": {
+   "description": "random Gaussian rows",
+   "shape": [
+    8,
+    256
+   ],
+   "sha256": {
+    "W": "71b72c3033e57bfd65410d0503fac46bdcb4ded5eb860cfe12d90385d2f8e2b3",
+    "codes": "057da089909c86518bab3d61dd00e7a7d797e18c0a6fa5d1df6ce4fd8586f254",
+    "fac": "2bf438745f871253ac99730be66373d4ce15a77c17cc0a3755790a4e7e8b4ee3",
+    "rs": "c6ff210a01707b9700db893849b8fd2dbd78c7bded01452a988f66230e2f8ea7",
+    "W_hat": "f1af106fa9fd4034baa6545c5a5e85f76ed542e6459f964e753f409a5af50d80"
+   }
+  },
+  "heavy_tail": {
+   "description": "Student-t (3) rows with outliers",
+   "shape": [
+    8,
+    256
+   ],
+   "sha256": {
+    "W": "44e53a2de81cc55cc5d1403f30b974019734d9512077b36155209fe48dccfb45",
+    "codes": "9f04c5a0b690fab774e3b2ccdfe72fe2bf08c0cfb8a27294c3e6554d1bda7131",
+    "fac": "ccf331c6d760fb646cf323432126fb52be2b5be06e8dcb8ba744206eb8f5195b",
+    "rs": "c5ee25cd70a54bbbec6cb261d43398af546e0a1637f76a13476e53b2e60f0aa7",
+    "W_hat": "80f9444f90fca63bfebfaf1df6d0365ee223b5dd21b41b3b41f3f3ee1a27ac18"
+   }
+  },
+  "factor_tie": {
+   "description": "blocks where several factors are exact; the smallest m must win",
+   "shape": [
+    2,
+    64
+   ],
+   "sha256": {
+    "W": "9883f8e55fd20dc7e3d64dc04d0b4543beb1f858a17a00632a71d31fec4d5342",
+    "codes": "989c5182ae5b1e2dd1202437a001004d7cad1be7b517ef21dcff7bf65d535ec7",
+    "fac": "1c1d2cab2ef420b74f28fc5d6a73a301ef46b2a90711ea2b08b11d35e7b0e153",
+    "rs": "42a2794dcc8eb49ad6946d3887e26f4969438ebc4fb35ed55efb44e5908f494e",
+    "W_hat": "9883f8e55fd20dc7e3d64dc04d0b4543beb1f858a17a00632a71d31fec4d5342"
+   }
+  },
+  "boundaries": {
+   "description": "values on and next to every magnitude boundary",
+   "shape": [
+    2,
+    64
+   ],
+   "sha256": {
+    "W": "417ca42661638c686460f27c05e5ce0d82f352eeee212a799cb6eaecec757c8c",
+    "codes": "ff30dbd6c80ecefbc1ca810b77102c75612fa64744913be234390243f55bbbd7",
+    "fac": "afdf0504bc6bd5c292ef234dacfe39d5bbcdb56a25c51bfd7ed133bc7895543a",
+    "rs": "bd7f1d063f1951e3072f31164e02df7ef38e2625d2f30ffe483a3def4ced1a24",
+    "W_hat": "ab856757b70e2428032808459445ec3625c602a2fef6ffcb1d87df6ee45c010e"
+   }
+  },
+  "negative_zero": {
+   "description": "-0.0 inputs must be stored as code 0",
+   "shape": [
+    2,
+    64
+   ],
+   "sha256": {
+    "W": "3a968755314aae1d8da2aa2af16d7ded0dd031f66657c1dbba70a59b2c171eff",
+    "codes": "3219cb09719dd2739233d36066672261656e9628ab01e23169a099719edbef79",
+    "fac": "884b26d8e2dd7934c842b19b03dee7e89063f23ff0ae3e9c9d64377481123e85",
+    "rs": "93e2a23869d2f3baadf05bfcea5113aa95c5a3add8fd5cc23211bc3bc1f7e353",
+    "W_hat": "1b04bf1d77e67ff0475bc4bfb1d47354956aabef3e6bfba5db1072996a5ab292"
+   }
+  },
+  "zero_and_tiny_rows": {
+   "description": "row scale 0, subnormal row scale, all-zero block",
+   "shape": [
+    4,
+    64
+   ],
+   "sha256": {
+    "W": "3cff90b483722b9a8deadb5742f7126af086cd256182785967ae9440d070086b",
+    "codes": "e14eb2bf86e7a16298b8005d646064571c1a0f3ec6e6b3c29f84ca8395161bcc",
+    "fac": "bdc772864f94da48e373fa35f03052185cd95e74525f49774c66de29702a26cf",
+    "rs": "622b213d973e509a2c78334168a855dedce691db864b1b8e5e602a5571adc4f7",
+    "W_hat": "e6b1c6cf49ffd7faf984ce4a7680e5d7286dd4286051b7fd47d160add5faf11a"
+   }
+  },
+  "largest_row": {
+   "description": "row scale at the FP16 maximum",
+   "shape": [
+    2,
+    64
+   ],
+   "sha256": {
+    "W": "0e4c32d7a39e4f9139dacbba7147f37b41e5fe65facc054149efbfcc652efe72",
+    "codes": "9b4a3929ccf496901de1c1609046faf87941dd8a905065a34196c4d4f9138c87",
+    "fac": "28625f27a2f3d7f965ec406e885f2f1050684660b9941c56e95d96c46bcb42f9",
+    "rs": "44ec032fecb5955cb3516fa7549be1bb73bc99d85fd6be956cdfb31b64160b41",
+    "W_hat": "aa28f24567138a2d9736accdf60965ee85f9be89997b1666ff8b5fb58bcf47dc"
+   }
+  },
+  "k64": {
+   "description": "K = 64: 6 factor bits, last word padded",
+   "shape": [
+    3,
+    64
+   ],
+   "sha256": {
+    "W": "faf227281b7bfc40c2c4284ff80c47a6a5599b38476261c044aef2a14d1d1b74",
+    "codes": "2d3792b1f0e63a54adec08c990826b61d9cd32a48cd5a12b1f450ec9e47a16b4",
+    "fac": "cb9fac7f22092519695d1686ecf20bf1f51659e4ebde6df8cfca8da28f7198d0",
+    "rs": "764cec79a249c6f584ad2459066144e2b2f37b599b925eaef88ce4598763748d",
+    "W_hat": "10274b1e504a512cc97485e975b2d44753b59dcb603500ab8ef9fb5c0b64bbf5"
+   }
+  },
+  "k96": {
+   "description": "K = 96: 9 factor bits",
+   "shape": [
+    3,
+    96
+   ],
+   "sha256": {
+    "W": "12d8719b08ee3251974d914b46fe04eefffd09c55cadd7c2ce6a6021706d9935",
+    "codes": "ff3f134a0d92230a548b3364edc96f5bf8904d3109068df79e77d7498b66975c",
+    "fac": "ffbf860149bf45424cf38a7ae63b05c81e9ddeed13e088cae913cae23bc130c7",
+    "rs": "acab885301783ca94c8689af746c58a6ca093d3b7f5815ff692470486ab7a039",
+    "W_hat": "d4d6dfbd6d40e08b5d1de6831d7f39f719c334978d4712062ce1913214d92db8"
+   }
+  },
+  "k1408": {
+   "description": "K = 1408 (Gemma expert width): 132 factor bits, padded to 5 words",
+   "shape": [
+    2,
+    1408
+   ],
+   "sha256": {
+    "W": "478766da7dae1d70aedffc537613831087a57f240de6efa00f65f4a806f5653b",
+    "codes": "70a76a94fc7125af3ee1851009bc900ab51919226060f31541254c3cb71d1200",
+    "fac": "1865abab6934a2326c0c80b103f3430d018a5f2e42b13974146e1fe3b88c0893",
+    "rs": "76e2a2e1a62d3f74c27777a943ca7080758dd8408a2fa5c66a102481ac172569",
+    "W_hat": "bba25937337935c004881f1e8f7df04a0f59f808360a462e279698c451b8388f"
+   }
+  },
+  "mixed_k1024": {
+   "description": "the edge cases above at K = 1024",
+   "shape": [
+    8,
+    1024
+   ],
+   "sha256": {
+    "W": "c5cc4923a4c786c8797cf0ae83864ddd9c02aa57d8fb3bbc85abb0d39ee3c178",
+    "codes": "a72ed9ac974408431a7d4cfa2ad0d189295b46cbd53efd2f6ae831596a3f4c8b",
+    "fac": "e1701eb80dad829d6a8a5bedcbdb1bf7dcde1a2457d4f07a8608f1a261d68796",
+    "rs": "9b058a9492cb32370527a949bbf2ce758803db87ca446fad2beafa1d0da30af8",
+    "W_hat": "55511289419bade0f19f51f2b7879b2999f027123117c3e403344c3691edc178"
+   }
+  }
+ }
+}

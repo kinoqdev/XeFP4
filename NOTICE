@@ -1,0 +1,15 @@
+XeFP4
+Copyright 2026 KINOQ
+
+This product includes software developed by KINOQ.
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+XeFP4 is an independent project. It is not affiliated with, sponsored by, or
+endorsed by Intel Corporation. Intel, Arc and Xe are trademarks of Intel
+Corporation and are used only to identify the hardware this software supports.
+
+Model weights published with this project (Hugging Face) are derived works of
+third-party models. The original copyright and license notices are kept in each
+model repository:
+  - Qwen3.5-9B by the Qwen team, Alibaba Cloud (Apache-2.0)
+  - Gemma 4 26B-A4B by Google DeepMind (Apache-2.0)
