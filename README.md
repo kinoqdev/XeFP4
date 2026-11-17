@@ -17,8 +17,8 @@ XeQ Runtime is written from scratch in OpenCL. It does not depend on llama.cpp, 
 
 | Model | Hugging Face | Size | Notes |
 |---|---|---|---|
-| Qwen3.5-9B | `kinoqdev/Qwen3.5-9B-XeFP4` | 5.1 GB (+ 0.12 GB MTP) | XeFP4-8 everywhere, INT8 lm_head, MTP speculative decoding |
-| Gemma 4 26B-A4B-it | `kinoqdev/gemma-4-26B-A4B-it-XeFP4` | 14.2 GB (Quality) / 13.4 GB (Speed) | MoE; optional vision encoder; MTP with the original assistant model (+0.84 GB) |
+| Qwen3.5-9B | [KINOQ/Qwen3.5-9B-XeFP4](https://huggingface.co/KINOQ/Qwen3.5-9B-XeFP4) | 5.1 GB (+ 0.12 GB MTP) | XeFP4-8 everywhere, INT8 lm_head, MTP speculative decoding |
+| Gemma 4 26B-A4B-it | [KINOQ/gemma-4-26B-A4B-it-XeFP4](https://huggingface.co/KINOQ/gemma-4-26B-A4B-it-XeFP4) | 14.2 GB (Quality) / 13.4 GB (Speed) | MoE; optional vision encoder; MTP with the original assistant model (+0.84 GB) |
 
 ## Performance (Intel Arc A770 16 GB, batch 1, greedy)
 
