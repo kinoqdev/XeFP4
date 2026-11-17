@@ -30,7 +30,8 @@ Scripted benchmark, 2026-11-17, driver 32.0.101.9150 (`python -m xeq bench`). Ge
 | Qwen3.5-9B | MTP on | 94.2 | OpenVINO INT4 + MTP: 56.7 |
 | Qwen3.5-9B | MTP on, 32K context | 62.7 | |
 | Gemma 4 26B-A4B-it | Speed | 92.1 | llama.cpp SYCL IQ4_XS: 32.4 |
-| Gemma 4 26B-A4B-it | Speed, 32K context | 68.8 | llama.cpp IQ4_XS at 16K: 19.3 |
+| Gemma 4 26B-A4B-it | Speed, 16K context | 76.6 | llama.cpp SYCL IQ4_XS at 16K: 19.3 |
+| Gemma 4 26B-A4B-it | Speed, 32K context | 68.8 | |
 | Gemma 4 26B-A4B-it | Quality | 72.1 | |
 | Gemma 4 26B-A4B-it | Quality + MTP, thinking / code | about 150 / 120 | |
 
