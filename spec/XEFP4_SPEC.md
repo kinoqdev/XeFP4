@@ -119,6 +119,10 @@ A model is a pair of files:
   - Linear layers made by stacking several source matrices along rows also carry `rows`: the row count of each part, in order (section 6).
   - Informational keys: `rel_rmse`, `norm_stats`, `lin_bits_per_weight`, `bytes_per_token`.
 
+Auxiliary files that are not XeFP4 weights, such as the Gemma 4 vision encoder (`"fmt": "g4v"`, INT8 or BF16), use the
+same `.bin`/`.json` pair but are engine-specific: their tensors are packed back to back without 256-byte alignment,
+and this specification does not define their layout.
+
 The main model header also holds:
 - `config`: the source model's text config. An auxiliary container such as the Qwen MTP file has no `config` and uses the main container's.
 
@@ -128,7 +132,7 @@ Release headers add the following keys. Readers ignore keys they do not know, so
 |---|---|---|
 | `xefp4_version` | `"1.0"` | spec version; a reader rejects a major version it does not know |
 | `model_profile` | `"qwen3_5"`, `"gemma4"` | tensor naming and stacking rules (section 6) |
-| `source` | `{"model": "<hub id>", "shards": {"<file>": "<sha256>"}}` | the exact weights the file was made from |
+| `source` | `{"model": "<hub id>", "index_sha256": "<sha256>", "shards": {"<file>": "<sha256>"}}` | the exact weights the file was made from: SHA-256 of the safetensors index and of each shard. `index_sha256` alone is allowed when the shards were not kept. |
 | `norm_form` | `{"rms": "1+w", "gated": "w", "qk": "1+w", "mtp": "1+w"}` | RMSNorm convention per norm group: multiply by `w` or by `1 + w`. If the key is absent, a reader may infer the form, but inference from weight statistics is unreliable: Qwen's final norm has mean 1.14 and is still `1+w`. |
 | `i8_scale` | `"fp32"` or `"fp16-rounded"` | how the INT8 row scales were chosen (section 4) |
 

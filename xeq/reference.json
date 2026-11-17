@@ -1,0 +1,17 @@
+{
+ "q35_xe8g32e.bin": {
+  "en": "ff689183558a9c63",
+  "code": "0576a3a8876d1413",
+  "ko": "a45a896a9ae6f83c"
+ },
+ "g4it_xe8.bin": {
+  "en": "cfead4d734c20764",
+  "code": "64c9c03dfa9baefc",
+  "ko": "b51b0c028311e7c3"
+ },
+ "g4it_xe8_ne8.bin": {
+  "en": "bd58a8547b70b02a",
+  "code": "40f21f2d6cc21aef",
+  "ko": "9ccae8072809fa17"
+ }
+}

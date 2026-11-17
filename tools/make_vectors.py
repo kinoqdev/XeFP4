@@ -5,11 +5,13 @@ usage: python tools/make_vectors.py [--out spec/vectors]
 import argparse
 import hashlib
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
 
-import xefp4_ref as R
+sys.path[:0] = [str(Path(__file__).resolve().parent), "."]   # find xefp4_ref and --encoder modules
+import xefp4_ref as R  # noqa: E402
 
 F = np.float32
 

@@ -15,7 +15,8 @@ from pathlib import Path
 
 import numpy as np
 
-import xefp4_ref as R
+sys.path[:0] = [str(Path(__file__).resolve().parent), "."]   # find xefp4_ref and --encoder modules
+import xefp4_ref as R  # noqa: E402
 
 
 def sha(a):
