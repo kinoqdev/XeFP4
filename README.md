@@ -35,9 +35,10 @@ Scripted benchmark, 2026-11-17, driver 32.0.101.9150 (`python -m xeq bench`). Ge
 | Gemma 4 26B-A4B-it | Quality | 72.1 | |
 | Gemma 4 26B-A4B-it | Quality + MTP, thinking / code | about 150 / 120 | |
 
-- Prefill, Qwen3.5-9B: 2,499 tok/s at 2K tokens, 1,738 tok/s at 32K (llama.cpp Q4_K_M pp512: 836).
-- Prefill, Gemma 4: about 1,650 tok/s at 512 tokens, 1,330 at 32K (llama.cpp IQ4_XS pp512: 694).
+- Prefill, Qwen3.5-9B: 3,117 tok/s at 2K tokens, 2,021 tok/s at 32K (engine update of 2026-11-20; 11-17 engine: 2,499 / 1,738; llama.cpp Q4_K_M pp512: 836).
+- Prefill, Gemma 4 Speed: 1,744 tok/s at 512 tokens, 1,386 at 32K (2026-11-20; 11-17 engine: about 1,650 / 1,330; llama.cpp IQ4_XS pp512: 694).
 - MTP gives the same output tokens as greedy decoding without MTP.
+- Multi-turn chat reuses the shared prefix of the previous request for both models (chat cache), so a follow-up turn only processes the new text.
 - Decoding is greedy by default; temperature, top-p/top-k/min-p, penalties and seed are available (see [ENGINE.md](ENGINE.md)).
 - MTP speed depends on the text: large gains for thinking and code, little or none for short prose answers, where the engine switches to plain decoding by itself. The Qwen 32K figure was measured on Korean prose (`bench --text <file>`); Gemma MTP figures come from `bench --mtp`. See the model cards for per-task tables.
 
@@ -47,10 +48,10 @@ Perplexity on 16 FineWeb documents × 512 tokens. Lower is better.
 
 | Model | BF16 | XeFP4 | GGUF Q4_K_M | GGUF IQ4_XS |
 |---|---|---|---|---|
-| Qwen3.5-9B | 11.164 | 11.682 (+4.6%) | 11.267 (+0.9%) | 11.341 (+1.6%) |
+| Qwen3.5-9B (revision 2) | 11.164 | 11.388 (+2.0%) | 11.267 (+0.9%) | 11.341 (+1.6%) |
 | Gemma 4 26B-A4B (base) | 6.670 | 6.981 (+4.7%, Speed) / 6.731 (+0.9%, Quality) | — | 6.827 (+2.4%) |
 
-- On Qwen3.5-9B, XeFP4 loses more accuracy than the GGUF K-quants. It trades that for speed: it uses no calibration and a fixed 4.1-bit layout. Improving accuracy without changing the format is ongoing work.
+- Qwen3.5-9B revision 2 (2026-11-20) was re-encoded with an error-compensating encoder and multilingual calibration data; the first release (no calibration) was at +4.9% measured the same way. The XeFP4 value is measured with XeQ Runtime; see the model card for the method and per-language results.
 - On Gemma 4, the Quality configuration (INT8 outside the experts) is closer to BF16 than GGUF IQ4_XS.
 
 ## Supported hardware
@@ -58,7 +59,7 @@ Perplexity on 16 FineWeb documents × 512 tokens. Lower is better.
 | GPU | Architecture | Status |
 |---|---|---|
 | Intel Arc A770 / A750 (Alchemist) | Xe-HPG | tested (A770) |
-| Intel Arc 140T (Arrow Lake-H iGPU) | Xe-LPG+ | tested: same output tokens as the A770; Qwen3.5-9B 23 tok/s with MTP; Gemma 4 Speed 23.6 tok/s, Quality + MTP 24–39 tok/s |
+| Intel Arc 140T (Arrow Lake-H iGPU) | Xe-LPG+ | tested: same output tokens as the A770; Qwen3.5-9B 23 tok/s with MTP; Gemma 4 Speed 23.6 tok/s, Quality + MTP 24–39 tok/s; 4K-token prefill Qwen3.5 about 670–780 tok/s, Gemma 4 Quality about 640 tok/s (75% shared memory recommended on 32 GB, see [ENGINE.md](ENGINE.md)) |
 | Intel Arc B-series, Lunar Lake (Xe2) | Xe2 | not tested |
 
 Requirements: Windows 10/11, Intel GPU OpenCL driver (tested: 32.0.101.9150 on the A770, 32.0.101.9033 on the 140T), Python 3.10 or later, `numpy`, `pyopencl`, `tokenizers`, `jinja2` (`pillow` for images). Linux is untested.

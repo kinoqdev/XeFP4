@@ -18,6 +18,11 @@ from ..device import knob
 def _nosplit(dev):
     return [] if "cl_intel_subgroup_split_matrix_multiply_accumulate" in dev.extensions else ["-DNOSPLIT"]
 
+
+def _slmbw():
+    """SLM stores as sub-group block writes (default; checked on the Arc A770 and 140T). XEQ_SLMBW=0 restores scalar stores."""
+    return ["-DSLMBW"] if knob("SLMBW", "1") == "1" else []
+
 GSRC = r"""
 #define UN __attribute__((opencl_unroll_hint))
 #ifdef NOSPLIT
@@ -54,7 +59,11 @@ __kernel void pgemm(__global const uint* A, __global const uint* B, __global flo
                               : gb + ((size_t)(((j) - NA) / UK) * KB + (kb) + ((j) - NA) % UK) * 64)
 #define LDST(buf, j) ((j) < NA ? &sA[buf][(j) * 64] : &sB[buf][((j) - NA) * 64])
 #define LOADG(kb) UN for (int q = 0; q < PER; q++) { int j = sg + q * NSG; if (j < TOT) st[q] = intel_sub_group_block_read8(GSRC(j, kb)); }
+#ifdef SLMBW   /* SLM stores as sub-group block writes (same layout) */
+#define STORE(buf) UN for (int q = 0; q < PER; q++) { int j = sg + q * NSG; if (j < TOT) intel_sub_group_block_write8(LDST(buf, j), st[q]); }
+#else
 #define STORE(buf) UN for (int q = 0; q < PER; q++) { int j = sg + q * NSG; if (j < TOT) { __local uint* d = LDST(buf, j); UN for (int i = 0; i < 8; i++) d[i * 8 + l] = st[q][i]; } }
+#endif
     LOADG(0);
     STORE(0);
     barrier(CLK_LOCAL_MEM_FENCE);
@@ -139,9 +148,15 @@ __kernel void pgemm4(__global const uint* A, __global const uint* codes, __globa
                         bfp(a1.s0, b1.s0), bfp(a1.s1, b1.s1), bfp(a1.s2, b1.s2), bfp(a1.s3, b1.s3)); } \
         } \
         stB[q] = o; } }
+#ifdef SLMBW
+#define STORE4(buf) \
+    UN for (int q = 0; q < PA; q++) { int j = sg + q * NSG; if (j < NA) intel_sub_group_block_write8(&sA[buf][j * 64], stA[q]); } \
+    UN for (int q = 0; q < PB; q++) { int j = sg + q * NSG; if (j < NB) intel_sub_group_block_write8(&sB[buf][j * 64], stB[q]); }
+#else
 #define STORE4(buf) \
     UN for (int q = 0; q < PA; q++) { int j = sg + q * NSG; if (j < NA) { UN for (int i = 0; i < 8; i++) sA[buf][j * 64 + i * 8 + l] = stA[q][i]; } } \
     UN for (int q = 0; q < PB; q++) { int j = sg + q * NSG; if (j < NB) { UN for (int i = 0; i < 8; i++) sB[buf][j * 64 + i * 8 + l] = stB[q][i]; } }
+#endif
     LOADG4(0);
     STORE4(0);
     barrier(CLK_LOCAL_MEM_FENCE);
@@ -495,6 +510,43 @@ __kernel void quantA8(__global const float* X, int ldx, __global uint* A8, __glo
     UNR for (int i = 0; i < 8; i++) o[i] = as_uint(convert_char4_sat_rte(vload4(i, x) * inv));
     SAt[(size_t)b * Mp + t] = s;
 }
+__attribute__((intel_reqd_sub_group_size(16)))
+__kernel void rmsq8(__global const float* X, __global const float* w, int H, float eps, int plus1, __global uint* A8, __global float* SAt, int Mp, int T) {
+    // rmsnormT + quantA8 in one pass (H == 4096: one float4 per thread). The sum uses rmsnormT's order, so the
+    // normalized values and therefore the INT8 codes are the same bits as the two-kernel path.
+    __local float r[64]; __local float tot;
+    int l = get_local_id(0), t = get_group_id(1), KB = H / 32, b = l >> 3;
+    __global uint* o = A8 + ((size_t)(t / 8) * KB + b) * 64 + (t % 8) * 8 + (l & 7);
+    float4 v = t < T ? vload4(l, X + (size_t)t * H) : (float4)(0.0f);
+    float s = sub_group_reduce_add(dot(v, v));
+    if (get_sub_group_local_id() == 0) r[get_sub_group_id()] = s;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (get_sub_group_id() == 0) { int j = get_sub_group_local_id(); float q = r[j] + r[j + 16] + r[j + 32] + r[j + 48]; q = sub_group_reduce_add(q); if (j == 0) tot = q; }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    float k = rsqrt(tot / H + eps); float4 g = vload4(l, w);
+    float4 y = v * k * (plus1 ? 1.0f + g : g);
+    float4 a = fabs(y); float mx = fmax(fmax(a.x, a.y), fmax(a.z, a.w));
+    mx = fmax(mx, intel_sub_group_shuffle_xor(mx, 1u)); mx = fmax(mx, intel_sub_group_shuffle_xor(mx, 2u)); mx = fmax(mx, intel_sub_group_shuffle_xor(mx, 4u));
+    float sc = mx > 0.0f ? mx / 127.0f : 1.0f;
+    *o = as_uint(convert_char4_sat_rte(y * (1.0f / sc)));
+    if ((l & 7) == 0) SAt[(size_t)b * Mp + t] = sc;
+}
+__kernel void swq8(__global const float* GU, int F, __global uint* A8, __global float* SAt, int Mp, int T) {
+    // swigluT + quantA8 for the down projection in one pass: same float values as silu(g) * u written to M and re-read.
+    int b = get_global_id(0), t = get_global_id(1), KB = F / 32;
+    __global uint* o = A8 + ((size_t)(t / 8) * KB + b) * 64 + (t % 8) * 8;
+    if (t >= T) { UNR for (int i = 0; i < 8; i++) o[i] = 0u; SAt[(size_t)b * Mp + t] = 1.0f; return; }
+    __global const float* g = GU + (size_t)t * 2 * F + b * 32; __global const float* u = g + F;
+    float4 v[8]; float mx = 0.0f;
+    UNR for (int i = 0; i < 8; i++) {
+        float4 gg = vload4(i, g), uu = vload4(i, u);
+        v[i] = (float4)(silu(gg.x) * uu.x, silu(gg.y) * uu.y, silu(gg.z) * uu.z, silu(gg.w) * uu.w);
+        float4 a = fabs(v[i]); mx = fmax(mx, fmax(fmax(a.x, a.y), fmax(a.z, a.w)));
+    }
+    float s = mx > 0.0f ? mx / 127.0f : 1.0f, inv = 1.0f / s;
+    UNR for (int i = 0; i < 8; i++) o[i] = as_uint(convert_char4_sat_rte(v[i] * inv));
+    SAt[(size_t)b * Mp + t] = s;
+}
 __kernel void packQ(__global const float* Q, __global uint* Aq, int NH, int kh) {
     int c2 = get_global_id(0), r = get_global_id(1);
     int t = r >> 2, g = r & 3; __global const float* q = Q + ((size_t)t * NH + kh * 4 + g) * 256;
@@ -550,7 +602,8 @@ GCFG = dict(RM=4, NT=4, WM=4, WN=4, UK=1, HSW=0)
 class Prefill:
     def __init__(self, m: Model, tmax=None):
         import os
-        tmax = tmax or int(knob("Q35_PCHUNK", "1024"))
+        # 2048-token chunks (prefill +7-13% on the A770 and 140T; about +1.1 GiB at a 32K context).
+        tmax = tmax or int(knob("Q35_PCHUNK", "2048"))
         self.m = m
         ctx = m.ctx
         import os
@@ -560,14 +613,16 @@ class Prefill:
         if knob("Q35_PCFG"):
             gc.update(zip(("RM", "NT", "WM", "WN", "UK"), (int(x) for x in os.environ["Q35_PCFG"].split(","))))
         self.gcfg = gc
-        self.gp = cl.Program(ctx, GSRC).build(options=[f"-D{k}={v}" for k, v in gc.items()] + [f"-DG={m.meta['G']}", f"-DXE8={int(m.meta['fmt'] == 'xe8')}", "-DNODEC=0", f"-DIB={self.ib}", "-cl-intel-256-GRF-per-thread"] + _nosplit(m.q.device))
+        self.gp = cl.Program(ctx, GSRC).build(options=[f"-D{k}={v}" for k, v in gc.items()] + [f"-DG={m.meta['G']}", f"-DXE8={int(m.meta['fmt'] == 'xe8')}", "-DNODEC=0", f"-DIB={self.ib}", "-cl-intel-256-GRF-per-thread"] + _nosplit(m.q.device) + _slmbw())
         self.kg4 = cl.Kernel(self.gp, "pgemm4")
         self.a8 = int(knob("Q35_A8", "1" if m.meta["fmt"] == "xe8" else "0"))
-        c8 = dict(GCFG); c8.update(zip(("RM", "NT", "WM", "WN", "UK"), (int(x) for x in knob("Q35_P8CFG", "4,4,8,4,2").split(","))))
+        self.fuse = int(knob("Q35_FUSE", "1"))   # fused norm/SwiGLU + INT8 quantization
+        self.fq = self.a8 and self.fuse and m.H == 4096          # rmsq8 assumes one float4 per thread (1024 threads)
+        c8 = dict(GCFG); c8.update(zip(("RM", "NT", "WM", "WN", "UK"), (int(x) for x in knob("Q35_P8CFG", "4,4,8,4,1").split(","))))   # K step 32 (A770 +3-4%, 140T +5%)
         self.c8 = c8; self.TR8 = 8 * c8["RM"] * c8["WM"]; self.TC8 = 8 * c8["NT"] * c8["WN"]
-        self.gp8 = cl.Program(ctx, GSRC).build(options=[f"-D{k}={v}" for k, v in c8.items()] + [f"-DG={m.meta['G']}", f"-DXE8={int(m.meta['fmt'] == 'xe8')}", "-DNODEC=0", "-DIB=1", "-cl-intel-256-GRF-per-thread"] + _nosplit(m.q.device))
+        self.gp8 = cl.Program(ctx, GSRC).build(options=[f"-D{k}={v}" for k, v in c8.items()] + [f"-DG={m.meta['G']}", f"-DXE8={int(m.meta['fmt'] == 'xe8')}", "-DNODEC=0", "-DIB=1", "-cl-intel-256-GRF-per-thread"] + _nosplit(m.q.device) + _slmbw())
         self.kg8 = cl.Kernel(self.gp8, "pgemm8")
-        self.bt = int(knob("Q35_BT", "0" if _nosplit(m.q.device) else "-1"))
+        self.bt = int(knob("Q35_BT", "-1"))                    # -1: tile B once per GEMM when T >= bt_min (all devices)
         self.bt_min = int(knob("Q35_BT_MIN", "768")); self.tkeep = {}
         self.kg8t = cl.Kernel(self.gp8, "pgemm8t"); self.ktb = cl.Kernel(self.gp8, "tileB8")
         self.gopt = [f"-D{k}={v}" for k, v in gc.items()] + [f"-DG={m.meta['G']}", f"-DXE8={int(m.meta['fmt'] == 'xe8')}", "-cl-intel-256-GRF-per-thread"] + _nosplit(m.q.device)
@@ -616,12 +671,14 @@ class Prefill:
             self.ev.append((label or name, e))
         return e
 
-    def gemm(self, name, Xb, ldx, Y, ldy, add, T):
+    def gemm(self, name, Xb, ldx, Y, ldy, add, T, quantized=False):
+        """quantized=True: the INT8 activations are already in Ap/SAt (fused producer kernel)."""
         m = self.m; t = m.tm[name + ".codes"]; N, K = t["shape"][0], t["shape"][1] * 2
         Tp = -(-T // self.TR) * self.TR
         I = np.int32
         if self.a8:
-            self.k("quantA8", (K // 32, Tp), None, Xb, I(ldx), self.Ap, self.SAt, I(K), I(Tp))
+            if not quantized:
+                self.k("quantA8", (K // 32, Tp), None, Xb, I(ldx), self.Ap, self.SAt, I(K), I(Tp))
             Np8 = -(-N // self.TC8) * self.TC8; ns8 = self.c8["WM"] * self.c8["WN"]
             bt = self.bt if self.bt >= 0 else int(T >= self.bt_min)
             if bt:
@@ -668,8 +725,12 @@ class Prefill:
         for li, lt in enumerate(m.cfg["layer_types"]):
             p = f"layers.{li}."
             NPl = m.tm[p + "proj.codes"]["shape"][0]
-            self.k("rmsnormT", (1024, Tp), (1024, 1), self.X, m.buf[p + "in_norm"], self.Xn, I(H), eps, I(m.p1))
-            self.gemm(p + "proj", self.Xn, H, self.P, NPl, 0, T)
+            if self.fq:
+                self.k("rmsq8", (1024, Tp), (1024, 1), self.X, m.buf[p + "in_norm"], I(H), eps, I(m.p1), self.Ap, self.SAt, I(Tp), I(T))
+                self.gemm(p + "proj", None, H, self.P, NPl, 0, T, quantized=True)
+            else:
+                self.k("rmsnormT", (1024, Tp), (1024, 1), self.X, m.buf[p + "in_norm"], self.Xn, I(H), eps, I(m.p1))
+                self.gemm(p + "proj", self.Xn, H, self.P, NPl, 0, T)
             if lt == "linear_attention":
                 st, S, PK, PD, PE = m.state[li]; CC = self.CC
                 ZO = CC; BO = ZO + m.VH * 128; AO = BO + m.VH
@@ -696,10 +757,18 @@ class Prefill:
                     self.k("attnT", (m.NH * 256, T), (256, 1), self.Q, kc, vc, self.P, I(NPl), self.A, self.SC, I(pos0), I(pos0 + T), I(m.KH), I(m.NH // m.KH))
                 ain = m.NH * 256
             self.gemm(p + "out", self.A, ain, self.X, H, 1, T)
-            self.k("rmsnormT", (1024, Tp), (1024, 1), self.X, m.buf[p + "post_norm"], self.Xn, I(H), eps, I(m.p1))
-            self.gemm(p + "gu", self.Xn, H, self.GU, 2 * F, 0, T)
-            self.k("swigluT", (-(-F // 256) * 256, T), (256, 1), self.GU, self.M, I(F))
-            self.gemm(p + "down", self.M, F, self.X, H, 1, T)
+            if self.fq:
+                self.k("rmsq8", (1024, Tp), (1024, 1), self.X, m.buf[p + "post_norm"], I(H), eps, I(m.p1), self.Ap, self.SAt, I(Tp), I(T))
+                self.gemm(p + "gu", None, H, self.GU, 2 * F, 0, T, quantized=True)
+            else:
+                self.k("rmsnormT", (1024, Tp), (1024, 1), self.X, m.buf[p + "post_norm"], self.Xn, I(H), eps, I(m.p1))
+                self.gemm(p + "gu", self.Xn, H, self.GU, 2 * F, 0, T)
+            if self.a8 and self.fuse:
+                self.k("swq8", (F // 32, Tp), None, self.GU, I(F), self.Ap, self.SAt, I(Tp), I(T))
+                self.gemm(p + "down", None, F, self.X, H, 1, T, quantized=True)
+            else:
+                self.k("swigluT", (-(-F // 256) * 256, T), (256, 1), self.GU, self.M, I(F))
+                self.gemm(p + "down", self.M, F, self.X, H, 1, T)
             m.q.flush()
         cl.enqueue_copy(m.q, m.h, self.X, src_offset=(T - 1) * H * 4, byte_count=H * 4)
 
@@ -723,14 +792,24 @@ class Prefill:
                 self.ev.append(("attnT", e))
             self.k("gateO", (256, R), None, self.ot, self.P, I(NPl), self.A, I(m.NH), I(kh), label="attnT")
 
-    def run_long(self, N, mtp=False):
-        """Feeds ids[0:N] in chunks. With mtp=True the MTP KV cache (positions 1..N) is filled per chunk as well."""
-        for c0 in range(0, N, self.Tmax):
-            T = min(self.Tmax, N - c0)
-            self.run(c0, T, c0)
+    def run_long(self, N, mtp=False, start=0, cuts=(), on_cut=None):
+        """Feeds ids[start:N] in chunks (state and KV before `start` must already be in place). With mtp=True the MTP KV
+        cache (positions start+1..N) is filled per chunk as well. A chunk ends at every position in `cuts`, and
+        on_cut(p) is called right after it (used to snapshot the linear-attention state for the chat cache).
+        Each token's result does not depend on where chunks end, so the outputs are the same bits as without cuts."""
+        cuts = sorted(p for p in set(cuts) if start < p <= N)
+        c0 = start
+        while c0 < N:
+            c1 = min(c0 + self.Tmax, N)
+            for p in cuts:
+                if c0 < p < c1:
+                    c1 = p; break
+            self.run(c0, c1 - c0, c0)
             if mtp:
-                self.mtp_fill(c0, T)
-            self.m.q.flush()
+                self.mtp_fill(c0, c1 - c0)
+            if on_cut is not None and c1 in cuts:
+                on_cut(c1)
+            self.m.q.flush(); c0 = c1
 
     def mtp_fill(self, c0, T):
         """Row t: (embed(ids[c0+t+1]), normed hidden t) -> MTP KV at position c0+t+1 (the last row is overwritten by the next MTP step)."""

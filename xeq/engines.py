@@ -148,7 +148,9 @@ class Gemma(_Sampled):
         from .gemma4 import model as GR
         from .gemma4.prefill import Prefill
         self.m = GR.Model(path, tmax=ctx); self.pf = Prefill(self.m); self.lock = threading.RLock(); self.stop = stop
-        self.cache = []
+        self.cache = []; self.plen = 0
+        from .device import knob as _knob
+        self.exact = int(_knob("G4_CACHE_EXACT", "1"))
         self.CAPS = min(L["CAP"] for L in self.m.lcfg if not L["kv"]); self.WIN = self.m.WIN
         self.vis = None
         if vision:
@@ -182,7 +184,9 @@ class Gemma(_Sampled):
 
     def _generate(self, ids, mx, on_tokens=None, step=4, reuse=True, spans=None, soft=None):
         """Greedy. KV of the previous request is reused for the common prefix (text-only requests); a sliding-layer ring
-        that was overwritten past the prefix is recomputed from prefix - ring size."""
+        that was overwritten past the prefix is recomputed from prefix - ring size. Only the previous prompt's KV is
+        reused (exact mode, default): the previous answer is processed again by prefill, so a cached request gives the
+        same tokens as the full prompt (KV written while decoding differs from prefill in the last bits)."""
         m = self.m; N = len(ids); use_mtp = self.mtp is not None and self.sp is not None
         mx = min(mx, m.TM - N - 8 - (self.MT.TB if use_mtp else 0))
         if mx < 1:
@@ -192,6 +196,8 @@ class Gemma(_Sampled):
             while P < min(len(c), N) and c[P] == ids[P]:
                 P += 1
             P = min(P, N - 1); E = len(c) + (8 if c else 0)                  # MTP may have written a few positions past the cache
+            if self.exact:
+                P = min(P, self.plen)
             if P < 32:
                 s = 0
             elif E - P <= self.CAPS - self.WIN:
@@ -214,7 +220,7 @@ class Gemma(_Sampled):
             if spans:
                 self.pf.set_images([])
             else:
-                self.cache = list(ids) + got[:j - 1]
+                self.cache = list(ids) + got[:j - 1]; self.plen = N
         out, hit = _cut(got, self.stop)
         return out, "stop" if hit else "length", (t1 - t0, t2 - t1, len(out), N - s)
 
@@ -376,14 +382,55 @@ class Qwen(_Sampled):
         if mtp:
             from .qwen35.spec import Spec
             self.sp = Spec(self.m, mtp)
+        from .device import knob
+        self.nsnap = int(knob("Q35_SNAPS", "4"))               # chat cache: linear-attention state snapshots kept
+        self.snaps, self.pool, self.cids = [], [], []
 
     @property
     def ctx(self):
         return self.m.TM
 
+    # Chat cache. Full-attention KV stays valid for a common prefix, but the linear-attention layers keep only the
+    # state after the last token, so the state is snapshotted during prefill (64 tokens before the prompt end, where the
+    # next turn's history usually still matches, and at the end). A request resumes from the latest snapshot inside the
+    # common prefix with the previous request (prompt + generated tokens) and feeds only the rest.
+    def _lin(self):
+        return [self.m.state[i] for i in sorted(self.m.state) if len(self.m.state[i]) == 5]
+
+    def _save(self, pos):
+        m = self.m; mf = cl.mem_flags
+        bufs = self.pool.pop() if self.pool else [(cl.Buffer(m.ctx, mf.READ_WRITE, S.size), cl.Buffer(m.ctx, mf.READ_WRITE, st.size)) for st, S, _, _, _ in self._lin()]
+        for (st, S, _, _, _), (bS, bst) in zip(self._lin(), bufs):
+            cl.enqueue_copy(m.q, bS, S); cl.enqueue_copy(m.q, bst, st)
+        self.snaps = [s for s in self.snaps if s[0] != pos] + [(pos, bufs)]
+
+    def _restore(self, bufs):
+        m = self.m
+        for (st, S, PK, PD, PE), (bS, bst) in zip(self._lin(), bufs):
+            cl.enqueue_copy(m.q, S, bS); cl.enqueue_copy(m.q, st, bst)
+            cl.enqueue_fill_buffer(m.q, PK, np.float32(0), 0, PK.size); cl.enqueue_fill_buffer(m.q, PD, np.float32(0), 0, PD.size)
+            cl.enqueue_fill_buffer(m.q, PE, np.float32(1), 0, PE.size)
+
+    def _resume(self, ids, reuse):
+        """-> start position (state restored up to it), and drops snapshots that the new prompt no longer shares."""
+        N = len(ids); P = 0; c = self.cids if reuse else []
+        while P < min(len(c), N) and c[P] == ids[P]:
+            P += 1
+        keep = [s for s in self.snaps if s[0] <= P - 1 and s[0] <= N - 1]       # position p needs ids[:p+1] unchanged (MTP KV at p)
+        self.pool += [s[1] for s in self.snaps if s not in keep]; self.snaps = keep
+        if not keep or self.nsnap <= 0:
+            return 0
+        s = max(keep, key=lambda x: x[0]); self._restore(s[1])
+        return s[0]
+
+    def _trim(self):
+        self.snaps.sort(key=lambda x: x[0])
+        while len(self.snaps) > self.nsnap:
+            self.pool.append(self.snaps.pop(0)[1])
+
     def _generate(self, ids, mx, on_tokens=None, step=16, reuse=True, spans=None, soft=None):
         """Greedy, with MTP speculative decoding when the MTP head is loaded (same tokens as without it).
-        The linear-attention state is not kept between requests, so every prompt is processed in full."""
+        Chat cache: the prefix shared with the previous request is not processed again (see _resume)."""
         if spans:
             raise ValueError("this model has no vision encoder")
         m = self.m; N = len(ids)
@@ -392,8 +439,11 @@ class Qwen(_Sampled):
             raise ValueError(f"prompt too long ({N} tokens, limit {m.TM - 25})")
         with self.lock:
             t0 = time.perf_counter()
+            s = self._resume(ids, reuse); self.cids = []
+            cuts = [p for p in (N - 64, N) if p > s and p >= SHORT] if self.nsnap > 0 else []
+            fast = s > 0 or N >= SHORT
             if self.sp is not None:
-                y0 = self.sp.prompt(ids) if N < SHORT else self.sp.prompt_fast(ids, self.pf)
+                y0 = self.sp.prompt_fast(ids, self.pf, start=s, cuts=cuts, on_cut=self._save) if fast else self.sp.prompt(ids)
                 got = [y0]; t1 = time.perf_counter(); done = y0 in self.stop
                 if on_tokens and not done:
                     on_tokens(got)
@@ -404,15 +454,17 @@ class Qwen(_Sampled):
                         on_tokens(_cut(got, self.stop)[0][:mx])
                 got = got[:mx]
             else:
-                m.reset()
-                if N < SHORT:
+                if s == 0:
+                    m.reset()
+                if not fast:
                     m.load_ids(ids)
                     for i in range(N):
                         m.step(i, out_step=0 if i == N - 1 else None, feed=i)
                 else:
-                    m.load_ids(list(ids) + [0]); self.pf.run_long(N); self.pf.first_token(0)
+                    m.load_ids(list(ids) + [0]); self.pf.run_long(N, start=s, cuts=cuts, on_cut=self._save); self.pf.first_token(0)
                 got = _rd(m, m.outs, 1); t1 = time.perf_counter()
                 got, _ = _decode(m, N, got, mx, self.stop, on_tokens, 4)
             m.q.finish(); t2 = time.perf_counter()
+            self._trim(); self.cids = list(ids) + list(got)
         out, hit = _cut(got, self.stop)
-        return out, "stop" if hit else "length", (t1 - t0, t2 - t1, len(out), N)
+        return out, "stop" if hit else "length", (t1 - t0, t2 - t1, len(out), N - s)

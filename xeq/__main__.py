@@ -13,7 +13,9 @@ python -m xeq <command> ...
 <model> is a model folder (or a .bin in it) holding the XeFP4 .bin/.json pair, tokenizer.json and chat_template.jinja.
 Options: --ctx N (KV cache length), -n N (max new tokens), --think (reasoning on), --system TEXT,
          --image FILE (Gemma 4, repeatable; loads the vision encoder), --no-mtp (plain decoding),
-         --kv fp16|fp32 (Gemma 4 KV cache, default fp16; fp32 doubles the KV memory).
+         --kv fp16|fp32 (Gemma 4 KV cache, default fp16; fp32 doubles the KV memory),
+         --prefill-chunk auto|small|N (prompt tokens per prefill pass; auto = 2048 where it helps and fits:
+         Qwen3.5 always, Gemma 4 on GPUs with 20 GiB or more; small = 512 / 1024, less memory).
 Sampling (default greedy): --temperature T --top-p P --top-k K --min-p P --presence-penalty X --repetition-penalty X --seed N"""
 from __future__ import annotations
 
@@ -30,7 +32,7 @@ def _args(argv):
     ap.add_argument("--ctx", type=int); ap.add_argument("--think", action="store_true"); ap.add_argument("--system")
     ap.add_argument("--image", action="append", default=[]); ap.add_argument("--vision", action="store_true")
     ap.add_argument("--no-mtp", action="store_true"); ap.add_argument("--mtp", action="store_true")
-    ap.add_argument("--kv", choices=("fp32", "fp16"))
+    ap.add_argument("--kv", choices=("fp32", "fp16")); ap.add_argument("--prefill-chunk", default="auto")
     ap.add_argument("--host", default="127.0.0.1"); ap.add_argument("--port", type=int, default=8080); ap.add_argument("--name")
     ap.add_argument("--out"); ap.add_argument("--text"); ap.add_argument("-h", "--help", action="store_true")
     for k, t in (("temperature", float), ("top-p", float), ("top-k", int), ("min-p", float), ("presence-penalty", float), ("repetition-penalty", float), ("seed", int)):
@@ -60,6 +62,19 @@ def _turn(eng, chat, msgs, a):
     return c, r
 
 
+def _chunk(v):
+    """--prefill-chunk -> the engines' chunk settings (read when a model is loaded)."""
+    if v == "auto":
+        return
+    if v == "small":
+        g, q = "512", "1024"
+    elif v.isdigit() and int(v) >= 64:
+        g = q = str(int(v))
+    else:
+        raise SystemExit("--prefill-chunk must be auto, small or a token count >= 64")
+    os.environ["XEQ_G4_PCH"], os.environ["XEQ_Q35_PCHUNK"] = g, q
+
+
 def _user(text, images):
     if not images:
         return {"role": "user", "content": text}
@@ -84,6 +99,7 @@ def main(argv=None):
     if not a.model:
         print(__doc__); sys.exit(2)
     from .engines import open_model
+    _chunk(a.prefill_chunk)
     if a.kv:
         import os as _os
         _os.environ["XEQ_G4_KV16"] = "1" if a.kv == "fp16" else "0"

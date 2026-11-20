@@ -59,9 +59,15 @@ W[n, k] ≈ rs[n] · (m[n, b] / 8) · g(code[n, k])          b = k // G
 
 With INT8 activations `x = sx · xq`, everything up to the final multiply by `rs[n] · sx / 8` is integer arithmetic.
 
-### 2.3 Encoder (deterministic, no calibration data)
+### 2.3 Reference encoder (deterministic, no calibration data)
 
-The encoder is specified exactly, so two conforming encoders produce identical bytes.
+The format is defined by the decoder (2.1–2.2): any codes, factors and row scales that follow the layout are a valid
+XeFP4 tensor. This section specifies the **reference encoder**. It is exact, so two conforming reference encoders
+produce identical bytes, and it is what the test vectors (section 7) check.
+
+Other encoders may choose the stored values differently, for example to reduce the error on real inputs. Their files
+need no decoder changes. The published models from 2026-11-19 on use an error-compensating encoder (GPTQ-style, with
+calibration data) for linear layers; their model cards say so.
 
 1. **Row scale:** `rs[n] = fp16(max(max_k |W[n,k]| / 12, 1e-12))` (round to nearest). All later steps use the FP16-rounded value.
    - FP16 subnormal values are allowed, and decoders must decode them correctly.

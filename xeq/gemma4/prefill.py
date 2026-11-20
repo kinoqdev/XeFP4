@@ -162,6 +162,7 @@ __kernel void gattnT(__global const float* Q, __global const KT* kc, __global co
     vstore16(o0 / su, 0, ap + l * 16); if (NC > 1) vstore16(o1 / su, 0, ap + 256 + l * 16);
 }
 __attribute__((intel_reqd_sub_group_size(16)))
+__attribute__((intel_reqd_sub_group_size(16)))      // r[8] assumes 8 sub-groups of 16 in a 128-wide work-group
 __kernel void routerT(__global const float* w, __global const float* x, __global float* lg, int E, int K) {
     __local float r[8];
     int e = get_group_id(0), t = get_group_id(1), l = get_local_id(0);
@@ -171,6 +172,24 @@ __kernel void routerT(__global const float* w, __global const float* x, __global
     if (get_sub_group_local_id() == 0) r[get_sub_group_id()] = acc;
     barrier(CLK_LOCAL_MEM_FENCE);
     if (l == 0) { float s = 0.0f; for (int i = 0; i < 8; i++) s += r[i]; lg[(size_t)t * E + e] = s; }
+}
+#define REB 16
+__attribute__((intel_reqd_sub_group_size(16)))
+__kernel void routerT2(__global const float* w, __global const float* x, __global float* lg, int E, int K) {
+    // routerT for REB experts per work-group: x is read once, and every (expert, token) sum keeps routerT's order
+    // (thread l: k = 4l, 4l+512, ...; sub-group sums; then sub-groups 0..7 in order), so the logits are the same bits.
+    __local float r[REB][8];
+    int e0 = get_group_id(0) * REB, t = get_group_id(1), l = get_local_id(0), sg = get_sub_group_id();
+    float4 xv[6];
+    UNR for (int i = 0; i < 6; i++) { int k = l * 4 + i * 512; xv[i] = k < K ? vload4(0, x + (size_t)t * K + k) : (float4)(0.0f); }
+    for (int j = 0; j < REB; j++) {
+        __global const float* we = w + (size_t)(e0 + j) * K; float acc = 0.0f;
+        UNR for (int i = 0; i < 6; i++) { int k = l * 4 + i * 512; if (k < K) acc += dot(vload4(0, we + k), xv[i]); }
+        acc = sub_group_reduce_add(acc);
+        if (get_sub_group_local_id() == 0) r[j][sg] = acc;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (l < REB) { float s = 0.0f; for (int i = 0; i < 8; i++) s += r[l][i]; lg[(size_t)t * E + e0 + l] = s; }
 }
 __kernel void topkT(__global const float* lg, __global const float* pes, __global int* idx, __global float* wt, int E, int TK) {
     __local float v[128]; __local int sel[16]; __local float pe[16];
@@ -264,6 +283,68 @@ __kernel void writeOg(__global const float* O, __global float* A, int NH, int kh
 }
 """
 
+# Skinny expert GEMM for few rows per expert (prefill chunk <= 1024): no SLM, no barriers; each sub-group decodes its
+# own columns straight into the DPAS B operand and reads A from global. Same per-element accumulation order as pgemm8e.
+SKSRC = r"""#ifndef SR
+#define SR 4
+#endif
+#ifndef SNT
+#define SNT 4
+#endif
+#ifndef SWN
+#define SWN 4
+#endif
+inline int8 decB(uint4 w, char mq) {
+    uint l0 = as_uint(as_char4(dlo(w.s0)) * mq), h0 = as_uint(as_char4(dhi(w.s0)) * mq);
+    uint l1 = as_uint(as_char4(dlo(w.s1)) * mq), h1 = as_uint(as_char4(dhi(w.s1)) * mq);
+    uint l2 = as_uint(as_char4(dlo(w.s2)) * mq), h2 = as_uint(as_char4(dhi(w.s2)) * mq);
+    uint l3 = as_uint(as_char4(dlo(w.s3)) * mq), h3 = as_uint(as_char4(dhi(w.s3)) * mq);
+    return as_int8((uint8)(il0(l0, h0), il1(l0, h0), il0(l1, h1), il1(l1, h1), il0(l2, h2), il1(l2, h2), il0(l3, h3), il1(l3, h3)));
+}
+__attribute__((intel_reqd_sub_group_size(8)))
+__kernel void pgemm8s(__global const uint* A, __global const float* SAt, int Mp, __global const uint* codes, __global const uint* fac, __global const half* rs,
+                      __global float* Y, int M, int N, int K, int ldy, int add, __global const int* tileE, int useE) {
+    int sg = get_sub_group_id(), l = get_sub_group_local_id();
+    int KB = K / 32, FW = (((K / G) * 3 + 31) / 32), KW = K / 8;
+    int rt0 = get_group_id(1) * SR;
+    int eid = useE ? tileE[get_group_id(1)] : 0;
+    int valid = eid >= 0; eid = max(eid, 0);
+    codes += (size_t)eid * N * KW; fac += (size_t)eid * N * FW; rs += (size_t)eid * N;
+    int ct0 = (get_group_id(0) * SWN + sg) * SNT;
+    __global const uint* cp[SNT]; __global const uint* fp[SNT]; int ok[SNT];
+    UN for (int c = 0; c < SNT; c++) { int n = (ct0 + c) * 8 + l; ok[c] = n < N; n = min(n, N - 1); cp[c] = codes + (size_t)n * KW; fp[c] = fac + (size_t)n * FW; }
+    float8 acc[SR][SNT];
+    UN for (int r = 0; r < SR; r++) UN for (int c = 0; c < SNT; c++) acc[r][c] = (float8)(0.f);
+    uint4 wn[SNT];
+    UN for (int c = 0; c < SNT; c++) wn[c] = vload4(0, cp[c]);
+    for (int kq = 0; kq < KB; kq++) {
+        uint4 w[SNT];
+        UN for (int c = 0; c < SNT; c++) w[c] = wn[c];
+        if (kq + 1 < KB) { UN for (int c = 0; c < SNT; c++) wn[c] = vload4(0, cp[c] + (kq + 1) * 4); }
+        int bo = ((kq * 32) / G) * 3;
+        int8 b[SNT];
+        UN for (int c = 0; c < SNT; c++) {
+            ulong fw = (ulong)fp[c][bo >> 5] | ((ulong)fp[c][(bo >> 5) + 1] << 32);
+            b[c] = ok[c] ? decB(w[c], (char)(((fw >> (bo & 31)) & 7) + 1)) : (int8)(0);
+        }
+        ATILE a[SR]; float8 sa[SR];
+        UN for (int r = 0; r < SR; r++) {
+            a[r] = as_int8(intel_sub_group_block_read8(A + ((size_t)(rt0 + r) * KB + kq) * 64));
+            sa[r] = vload8(0, SAt + (size_t)kq * Mp + (rt0 + r) * 8);
+        }
+        UN for (int r = 0; r < SR; r++) UN for (int c = 0; c < SNT; c++)
+            acc[r][c] += convert_float8(MADI8(a[r], b[c], (int8)(0))) * sa[r];
+    }
+    UN for (int r = 0; r < SR; r++) UN for (int c = 0; c < SNT; c++) UN for (int m = 0; m < 8; m++) {
+        int row = (rt0 + r) * 8 + m, col = (ct0 + c) * 8 + l;
+        if (valid && row < M && col < N) {
+            float v = acc[r][c][m] * vload_half(col, rs) * 0.125f;
+            size_t o = (size_t)row * ldy + col; Y[o] = add ? Y[o] + v : v;
+        }
+    }
+}
+"""
+
 
 def _x8src():
     """W4A8 XMX: takes pgemm8/pgemm8t from the Qwen prefill, rounds the factor-row length up (K = 704, 2112, 2816)
@@ -272,12 +353,17 @@ def _x8src():
     s = QP.GSRC.replace("(K / G) * 3 / 32", "(((K / G) * 3 + 31) / 32)")
     a = s.index("__attribute__((intel_reqd_sub_group_size(8)))\n__kernel void pgemm8(")
     b = s.index("// TILE-SCRATCH")
+    i8 = s[a:b].replace("__kernel void pgemm8(", "__kernel void pgemm8i(", 1)
+    d0 = i8.index("uint4 w = vload4(0, codes + (size_t)n * (K / 8) + kq * 4);")
+    d1 = i8.index("o = (uint8)(il0(l0, h0)"); d1 = i8.index("\\", d1)
+    i8 = i8[:d0] + "o = vload8(0, codes + ((size_t)n * K + kq * 32) / 4);   /* INT8 row bytes = DPAS B operand */ " + i8[d1:]
+    # pgemm8i: INT8 weights read row-major straight into the B operand (no tileI8 pass); codes = q, rs = s*8 (FP16)
     e = s[a:b].replace("__kernel void pgemm8(", "__kernel void pgemm8e(", 1)
     e = e.replace("__global float* Y, int M, int N, int K, int ldy, int add) {", "__global float* Y, int M, int N, int K, int ldy, int add, __global const int* tileE) {", 1)
     anchor = "int KB = K / 32, FW = (((K / G) * 3 + 31) / 32);"
     assert anchor in e
     e = e.replace(anchor, anchor + "\n    int eid = tileE[get_group_id(1)]; int valid = eid >= 0; eid = max(eid, 0);"
-                  "\n    codes += (size_t)eid * N * (K / 8); fac += (size_t)eid * N * FW; rs += (size_t)eid * N;", 1)
+                                    "\n    codes += (size_t)eid * N * (K / 8); fac += (size_t)eid * N * FW; rs += (size_t)eid * N;", 1)
     assert e.count("if (row < M && col < N) {") == 1
     e = e.replace("if (row < M && col < N) {", "if (valid && row < M && col < N) {")
     extra = r"""
@@ -316,6 +402,18 @@ __kernel void buildl2(__global const int* idx, int A, int E, int TK, int TRE, __
     for (int a = l; a < A; a += 1024) { int e = idx[a], p = atomic_inc(&cur[e]), r = off[e] + p; prow[a] = r; rmap[r] = a / TK; }
     if (l < E) for (int k = 0; k * TRE < cnt[l]; k++) tileE[off[l] / TRE + k] = l;
 }
+__kernel void gq8(__global const float* GU, int F, int Mreal, __global uint* A8, __global float* SAt, int Mp) {
+    // geglu + quantA8m (no row map) in one pass: same values as gelu(g) * u written out and re-read.
+    int b = get_global_id(0), t = get_global_id(1), KB = F / 32;
+    __global uint* o = A8 + ((size_t)(t / 8) * KB + b) * 64 + (t % 8) * 8;
+    if (t >= Mreal) { UNR for (int i = 0; i < 8; i++) o[i] = 0u; SAt[(size_t)b * Mp + t] = 0.0f; return; }
+    __global const float* g = GU + (size_t)t * 2 * F + b * 32;
+    float v[32]; float mx = 0.0f;
+    UNR for (int i = 0; i < 32; i++) { v[i] = gelu(g[i]) * g[F + i]; mx = fmax(mx, fabs(v[i])); }
+    float s = mx > 0.0f ? mx / 127.0f : 1.0f, inv = 1.0f / s;
+    UNR for (int i = 0; i < 8; i++) o[i] = as_uint(convert_char4_sat_rte((float4)(v[4 * i], v[4 * i + 1], v[4 * i + 2], v[4 * i + 3]) * inv));
+    SAt[(size_t)b * Mp + t] = s;
+}
 __kernel void ecomb2(__global const float* eo, __global const int* prow, __global const float* wt, __global float* e, int H, int TK) {
     int i = get_global_id(0), t = get_global_id(1); if (i >= H) return;
     float s = 0.0f;
@@ -323,7 +421,7 @@ __kernel void ecomb2(__global const float* eo, __global const int* prow, __globa
     e[(size_t)t * H + i] = s;
 }
 """
-    return s + e, extra
+    return s + e + i8, extra
 
 
 class Prefill:
@@ -332,14 +430,23 @@ class Prefill:
         self.prg = cl.Program(m.ctx, GR.GSRC + PSRC).build(options=[f"-DG={m.meta['G']}", "-DR=1", f"-DTB={self.TB}"])
         self.a8 = int(knob("G4_A8", "1"))
         self.a8d, self.a8e = int(knob("G4_A8D", "1")), int(knob("G4_A8E", "1"))
+        ns_ = "1" if GR.K2.nosplit(m.q.device) else "0"                 # skinny expert kernel: GPUs without split DPAS only
+        self.fuse = int(knob("G4_FUSE", "1"))
+        self.i8direct = int(knob("G4_I8DIRECT", "1"))
         if self.a8:
             from ..qwen35.prefill import GCFG
             X8, XAUX = _x8src(); ctx = m.ctx; base = [f"-DG={m.meta['G']}", "-DXE8=1", "-DNODEC=0", "-DIB=1", "-cl-intel-256-GRF-per-thread"] + GR.K2.nosplit(m.q.device)
+            from ..qwen35.prefill import _slmbw
+            base += _slmbw()
             def cfg(env, dflt):
                 c = dict(GCFG); c.update(zip(("RM", "NT", "WM", "WN", "UK"), (int(x) for x in knob(env, dflt).split(",")))); return c
             self.cd, self.ce = cfg("G4_P8D", "4,4,8,4,2"), cfg("G4_P8E", "2,4,4,4,2")
             self.pd = cl.Program(ctx, X8).build(options=[f"-D{k}={v}" for k, v in self.cd.items()] + base)
-            self.pe = cl.Program(ctx, X8).build(options=[f"-D{k}={v}" for k, v in self.ce.items()] + base)
+            ex = []
+            self.skinny = int(knob("G4_SKINNY", "1" if self.T <= 1024 and ns_ == "1" else "0"))
+            self.SR, self.SNT, self.SWN = (int(x) for x in knob("G4_SK", "4,2,8").split(","))
+            sko = [f"-DSR={self.SR}", f"-DSNT={self.SNT}", f"-DSWN={self.SWN}"]
+            self.pe = cl.Program(ctx, X8 + (SKSRC if self.skinny else "")).build(options=[f"-D{k}={v}" for k, v in self.ce.items()] + base + ex + sko)
             self.pa = cl.Program(ctx, GR.GSRC + XAUX).build(options=[f"-DG={m.meta['G']}", "-DR=1"])
             for nm, pr, kn in (("dense", self.pd, "pgemm8"), ("dense", self.pd, "pgemm8t"), ("expert", self.pe, "pgemm8e")):
                 zb = bytes(pr.get_info(cl.program_info.BINARIES)[0]); i = zb.find(("name:            " + kn + chr(10)).encode())
@@ -348,6 +455,8 @@ class Prefill:
                     print(f"warning: {nm} {kn} was built with EU fusion disabled; split DPAS results may be wrong", flush=True)
             self.TRD = 8 * self.cd["RM"] * self.cd["WM"]; self.TCD = 8 * self.cd["NT"] * self.cd["WN"]
             self.TRE = 8 * self.ce["RM"] * self.ce["WM"]; self.TCE = 8 * self.ce["NT"] * self.ce["WN"]
+            if self.skinny:
+                self.TRE, self.TCE = 8 * self.SR, 8 * self.SNT * self.SWN
             self.Tp = -(-self.T // self.TRD) * self.TRD
             self.MPE = -(-(self.T * m.TK + m.NE * (self.TRE - 1)) // self.TRE) * self.TRE
             mf = cl.mem_flags; i32 = lambda n: cl.Buffer(ctx, mf.READ_WRITE, max(4, int(n) * 4))
@@ -355,7 +464,7 @@ class Prefill:
             self.A8 = cl.Buffer(ctx, mf.READ_WRITE, max(self.Tp, self.MPE) * Kmax)
             self.SA = i32(max(self.Tp, self.MPE) * Kmax // 32)
             self.PROW, self.RMAP, self.TLE = i32(self.T * m.TK), i32(self.MPE), i32(self.MPE // self.TRE)
-            self.EGUp, self.EMp, self.EOp = i32(self.MPE * 2 * m.FE), i32(self.MPE * m.FE), i32(self.MPE * m.H)
+            self.EGUp, self.EMp, self.EOp = i32(self.MPE * 2 * m.FE), i32(1 if self.fuse else self.MPE * m.FE), i32(self.MPE * m.H)   # EMp only on the unfused path
             i8 = [k[:-2] for k in m.tm if k.endswith(".q") and k != "lm_head.q"]
             if i8:
                 self.BT = cl.Buffer(ctx, mf.READ_WRITE, max(-(-m.tm[k + ".q"]["shape"][0] // 8) * 8 * m.tm[k + ".q"]["shape"][1] for k in i8))
@@ -372,14 +481,16 @@ class Prefill:
         self.A = T * TK; self.maxt = self.A // self.TB + m.NE
         self.RL, self.IDX, self.WT = f32(T * m.NE), f32(self.A), f32(self.A)
         self.LT, self.LA, self.TL = f32(self.A), f32(self.A), f32(self.maxt * 4)
-        self.EGU, self.EM, self.EO = f32(self.A * 2 * FE), f32(self.A * FE), f32(self.A * H)
+        fb = not (self.a8 and self.a8e)                                    # float expert path buffers only when it is used
+        self.EGU, self.EM, self.EO = (f32(self.A * 2 * FE), f32(self.A * FE), f32(self.A * H)) if fb else (f32(1), f32(1), f32(1))
         self.LR = 64; self.LOG = f32(self.LR * m.V)
         self.amm = int(knob("G4_AMM", "1"))
         self.amm_min = int(knob("G4_AMM_MIN", "512"))
+        self.aband = int(knob("G4_ABAND", "1"))                 # band-limited key range per row block on sliding layers
         if self.amm:
             from ..qwen35 import prefill as QP
             gc = dict(QP.GCFG); gc.update(WM=8, UK=2)
-            self.gpm = cl.Program(m.ctx, QP.GSRC).build(options=[f"-D{k}={v}" for k, v in gc.items()] + [f"-DG={m.meta['G']}", "-DXE8=1", "-DNODEC=0", "-DIB=1", "-cl-intel-256-GRF-per-thread"] + QP._nosplit(m.q.device))
+            self.gpm = cl.Program(m.ctx, QP.GSRC).build(options=[f"-D{k}={v}" for k, v in gc.items()] + [f"-DG={m.meta['G']}", "-DXE8=1", "-DNODEC=0", "-DIB=1", "-cl-intel-256-GRF-per-thread"] + QP._nosplit(m.q.device) + QP._slmbw())
             zb = bytes(self.gpm.get_info(cl.program_info.BINARIES)[0]); i = zb.find(("name:            pgemm" + chr(10)).encode()); j = zb.find(b"- name:", i + 10)
             self.amm_nofuse = b"require_disable_eufusion: true" in zb[i:j if j > 0 else len(zb)]
             if self.amm_nofuse:
@@ -420,6 +531,9 @@ class Prefill:
         qa[0].set_args(x, I(ldx), self.PROW, I(0), I(Tn), self.A8, self.SA, I(Kd), I(Tp))
         g = (-(-N // self.TCD) * ns * 8, Tp // self.TRD); lsz = (ns * 8, 1)
         if i8:
+            if self.i8direct:
+                k = cl.Kernel(self.pd, "pgemm8i"); k.set_args(self.A8, self.SA, I(Tp), m.buf[name + ".q"], m.buf[name + ".q"], m.buf[name + ".rs8"], y, I(Tn), I(N), I(Kd), I(ldy), I(add))
+                return [qa, (k, g, lsz)]
             tb = (cl.Kernel(self.pa, "tileI8"), (-(-(Kd // 32 * 8) // 64) * 64, -(-N // 8)), (64, 1)); tb[0].set_args(m.buf[name + ".q"], self.BT, I(N), I(Kd))
             k = cl.Kernel(self.pd, "pgemm8t"); k.set_args(self.A8, self.SA, I(Tp), self.BT, m.buf[name + ".rs8"], y, I(Tn), I(N), I(Kd), I(ldy), I(add))
             return [qa, tb, (k, g, lsz)]
@@ -431,14 +545,21 @@ class Prefill:
         m, I = self.m, np.int32; H, FE, TK, A = m.H, m.FE, m.TK, Tn * m.TK; ns = self.ce["WM"] * self.ce["WN"]; b = m.buf
         out = [self.K2(self.pa, "buildl2", (1024,), (1024,), self.IDX, I(A), I(m.NE), I(TK), I(self.TRE), self.PROW, self.RMAP, self.TLE, I(self.MPE)),
                self.K2(self.pa, "quantA8m", (H // 32, self.MPE), None, self.T3, I(H), self.RMAP, I(1), I(Tn), self.A8, self.SA, I(H), I(self.MPE))]
-        k = cl.Kernel(self.pe, "pgemm8e"); k.set_args(self.A8, self.SA, I(self.MPE), b[p + "egu.codes"], b[p + "egu.fac"], b[p + "egu.rs"], self.EGUp,
-                                                      I(self.MPE), I(2 * FE), I(H), I(2 * FE), I(0), self.TLE)
-        out.append((k, (-(-2 * FE // self.TCE) * ns * 8, self.MPE // self.TRE), (ns * 8, 1)))
-        out += [self.K("geglu", (-(-FE * self.MPE // 256) * 256,), (256,), self.EGUp, self.EMp, I(FE), I(self.MPE)),
-                self.K2(self.pa, "quantA8m", (FE // 32, self.MPE), None, self.EMp, I(FE), self.RMAP, I(0), I(self.MPE), self.A8, self.SA, I(FE), I(self.MPE))]
-        k = cl.Kernel(self.pe, "pgemm8e"); k.set_args(self.A8, self.SA, I(self.MPE), b[p + "edown.codes"], b[p + "edown.fac"], b[p + "edown.rs"], self.EOp,
-                                                      I(self.MPE), I(H), I(FE), I(H), I(0), self.TLE)
-        out.append((k, (-(-H // self.TCE) * ns * 8, self.MPE // self.TRE), (ns * 8, 1)))
+        def ek(w, Y, N, Kd):
+            if self.skinny:
+                k = cl.Kernel(self.pe, "pgemm8s"); k.set_args(self.A8, self.SA, I(self.MPE), b[p + w + ".codes"], b[p + w + ".fac"], b[p + w + ".rs"], Y,
+                                                              I(self.MPE), I(N), I(Kd), I(N), I(0), self.TLE, I(1))
+                return (k, (-(-N // self.TCE) * self.SWN * 8, self.MPE // self.TRE), (self.SWN * 8, 1))
+            k = cl.Kernel(self.pe, "pgemm8e"); k.set_args(self.A8, self.SA, I(self.MPE), b[p + w + ".codes"], b[p + w + ".fac"], b[p + w + ".rs"], Y,
+                                                          I(self.MPE), I(N), I(Kd), I(N), I(0), self.TLE)
+            return (k, (-(-N // self.TCE) * ns * 8, self.MPE // self.TRE), (ns * 8, 1))
+        out.append(ek("egu", self.EGUp, 2 * FE, H))
+        if self.fuse:
+            out += [self.K2(self.pa, "gq8", (FE // 32, self.MPE), None, self.EGUp, I(FE), I(self.MPE), self.A8, self.SA, I(self.MPE))]
+        else:
+            out += [self.K("geglu", (-(-FE * self.MPE // 256) * 256,), (256,), self.EGUp, self.EMp, I(FE), I(self.MPE)),
+                    self.K2(self.pa, "quantA8m", (FE // 32, self.MPE), None, self.EMp, I(FE), self.RMAP, I(0), I(self.MPE), self.A8, self.SA, I(FE), I(self.MPE))]
+        out.append(ek("edown", self.EOp, H, FE))
         out.append(self.K2(self.pa, "ecomb2", (-(-H // 256) * 256, Tn), (256, 1), self.EOp, self.PROW, self.WT, self.E, I(H), I(TK)))
         return out
 
@@ -483,9 +604,16 @@ class Prefill:
             GM = (lambda *a: self.gemm8(*a)) if (self.a8 and self.a8d) else (lambda *a: [self.gemm(*a)])
             ks += GM(p + "proj", self.TN, H, self.P, self.ldP, Tn) + [kp, ka] + GM(p + "out", self.Ab, NH * HD, self.O, H, Tn)
             ks += [self.K("postattnT", (1024, Tn), (1024, 1), self.O, b[p + "post_attn"], self.X, b[p + "pre_ff"], b[p + "pre_ff2"], self.TN, self.T3, self.T2, I(H), eps)]
-            ks += GM(p + "gu", self.TN, H, self.GU, 2 * F, Tn) + [self.K("geglu", (-(-F * Tn // 256) * 256,), (256,), self.GU, self.M, I(F), I(Tn))]
-            ks += GM(p + "down", self.M, F, self.D1, H, Tn)
-            ks += [self.K("routerT", (m.NE * 128, Tn), (128, 1), b[p + "r_projF"], self.T2, self.RL, I(m.NE), I(H)),
+            if self.a8 and self.a8d and self.fuse:                                   # gemm8 list = [quantA8m, (tileI8,) gemm]
+                Tpd = -(-Tn // self.TRD) * self.TRD
+                ks += GM(p + "gu", self.TN, H, self.GU, 2 * F, Tn) + [self.K2(self.pa, "gq8", (F // 32, Tpd), None, self.GU, I(F), I(Tn), self.A8, self.SA, I(Tpd))]
+                ks += GM(p + "down", self.M, F, self.D1, H, Tn)[1:]          # activations already quantized by gq8
+            else:
+                ks += GM(p + "gu", self.TN, H, self.GU, 2 * F, Tn) + [self.K("geglu", (-(-F * Tn // 256) * 256,), (256,), self.GU, self.M, I(F), I(Tn))]
+                ks += GM(p + "down", self.M, F, self.D1, H, Tn)
+            r2 = knob("G4_ROUTER2", "1") == "1" and H <= 3072 and m.NE % 16 == 0
+            ks += [self.K("routerT2", (m.NE // 16 * 128, Tn), (128, 1), b[p + "r_projF"], self.T2, self.RL, I(m.NE), I(H)) if r2 else
+                   self.K("routerT", (m.NE * 128, Tn), (128, 1), b[p + "r_projF"], self.T2, self.RL, I(m.NE), I(H)),
                    self.K("topkT", (128, Tn), (128, 1), self.RL, b[p + "r_pes"], self.IDX, self.WT, I(m.NE), I(TK))]
             if self.a8 and self.a8e:
                 ks += self.experts8(p, Tn)
@@ -512,17 +640,30 @@ class Prefill:
             k = self.akc[name]; k.set_args(*args); e = cl.enqueue_nd_range_kernel(q, k, g, l)
             if evs is not None:
                 evs.append(("attn." + name, e))
+        # Band: on sliding layers a row block only needs keys [first position - WIN + 1, last position], so K/V are packed
+        # and multiplied per row block over that range instead of the whole chunk range (same keys per row, less work).
+        # Not with image spans (bidirectional rows can reach past the band).
+        band = self.aband and L["WIN"] < jhi and not self.spans
         for kh in range(KH):
-            go("packKg", (Lp, HD // 2), None, kc, self.bk, I(KH), I(kh), I(HD), I(jlo), I(jhi), I(L["CAP"]))
-            go("packVg", (HD, Lp // 2), None, vc, self.bv, I(KH), I(kh), I(HD), I(jlo), I(jhi), I(L["CAP"]), I(Lp // 16))
+            if not band:
+                go("packKg", (Lp, HD // 2), None, kc, self.bk, I(KH), I(kh), I(HD), I(jlo), I(jhi), I(L["CAP"]))
+                go("packVg", (HD, Lp // 2), None, vc, self.bv, I(KH), I(kh), I(HD), I(jlo), I(jhi), I(L["CAP"]), I(Lp // 16))
             for rb0 in range(0, R, RB):
+                jl, Lq = jlo, Lp
+                if band:
+                    t_first, t_last = pos0 + rb0 // GQ, pos0 + (min(R, rb0 + RB) - 1) // GQ
+                    jl = max(jlo, t_first + 1 - L["WIN"]); jh = min(jhi, t_last + 1)
+                    jl -= jl % 128                                   # absolute 128 grid: the same key blocks whatever the chunking (masked keys add 0)
+                    Lq = -(-(jh - jl) // 128) * 128
+                    go("packKg", (Lq, HD // 2), None, kc, self.bk, I(KH), I(kh), I(HD), I(jl), I(jh), I(L["CAP"]))
+                    go("packVg", (HD, Lq // 2), None, vc, self.bv, I(KH), I(kh), I(HD), I(jl), I(jh), I(L["CAP"]), I(Lq // 16))
                 go("packQg", (HD // 2, RB), None, self.Qb, self.aq, I(NH), I(kh), I(GQ), I(HD), I(rb0), I(R))
-                kg.set_args(self.aq, self.bk, self.Sm, I(RB), I(Lp), I(HD), I(Lp), I(0))
-                e = cl.enqueue_nd_range_kernel(q, kg, (Lp // self.ATC * ns * 8, RB // self.ATR), (ns * 8, 1))
+                kg.set_args(self.aq, self.bk, self.Sm, I(RB), I(Lq), I(HD), I(Lq), I(0))
+                e = cl.enqueue_nd_range_kernel(q, kg, (Lq // self.ATC * ns * 8, RB // self.ATR), (ns * 8, 1))
                 if evs is not None:
                     evs.append(("attn.QK", e))
-                go("softPg", (RB * 256,), (256,), self.Sm, I(Lp), self.ap, I(pos0), I(rb0), I(R), I(GQ), I(jlo), I(L["WIN"]), self.UB, I(0 if L["kv"] else 1))
-                kg.set_args(self.ap, self.bv, self.ot, I(RB), I(HD), I(Lp), I(HD), I(0))
+                go("softPg", (RB * 256,), (256,), self.Sm, I(Lq), self.ap, I(pos0), I(rb0), I(R), I(GQ), I(jl), I(L["WIN"]), self.UB, I(0 if L["kv"] else 1))
+                kg.set_args(self.ap, self.bv, self.ot, I(RB), I(HD), I(Lq), I(HD), I(0))
                 e = cl.enqueue_nd_range_kernel(q, kg, (HD // self.ATC * ns * 8, RB // self.ATR), (ns * 8, 1))
                 if evs is not None:
                     evs.append(("attn.PV", e))

@@ -526,13 +526,17 @@ class Spec:
         self.base, self.it = T, 0
         return int(y0[0])
 
-    def prompt_fast(self, ids, pf):
-        """Long prompt: chunked prefill with the MTP KV filled at once -> first token y0, first draft d0."""
+    def prompt_fast(self, ids, pf, start=0, cuts=(), on_cut=None):
+        """Long prompt: chunked prefill with the MTP KV filled at once -> first token y0, first draft d0.
+        start > 0: main state, KV and MTP KV up to `start` are already in place (chat cache); only ids[start:] are fed."""
         m = self.m; T = len(ids)
-        m.reset(); m.load_ids(list(ids) + [0])
-        for kq in (m.mkc, m.mvc):
-            cl.enqueue_fill_buffer(m.q, kq, np.float32(0), 0, kq.size)
-        pf.run_long(T, mtp=True)
+        if start == 0:
+            m.reset()
+        m.load_ids(list(ids) + [0])
+        if start == 0:
+            for kq in (m.mkc, m.mvc):
+                cl.enqueue_fill_buffer(m.q, kq, np.float32(0), 0, kq.size)
+        pf.run_long(T, mtp=True, start=start, cuts=cuts, on_cut=on_cut)
         pf.first_token(0)
         m.mtp_step(T, 0)
         y0, d0 = np.zeros(1, np.int32), np.zeros(1, np.int32)

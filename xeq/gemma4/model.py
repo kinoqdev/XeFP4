@@ -616,7 +616,10 @@ class Model:
         dch = 128 if self.gqa == 2 else 32; self.tile_s = int(knob("G4_TILES", "0"))
         self.CHG, self.CHS = int(knob("G4_CHG", dch)), int(knob("G4_CHS", 128 if self.gqa == 2 else 32))
         self.SM = -(-self.TM // (min(self.CHG, self.CHS) if self.gqa else self.CH))
-        self.PCH = int(knob("G4_PCH", "512"))
+        from ..device import device as _dev
+        # Prefill chunk: 2048 tokens gives the experts about 4x more rows per weight pass (Arc 140T prompt processing
+        # +40%) but needs about 1.2 GiB more (larger sliding-window ring and work buffers); only with a 20 GiB+ device.
+        self.PCH = int(knob("G4_PCH", "2048" if _dev().global_mem_size >= 20 * 2**30 else "512"))
         rp = c["rope_parameters"]
         self.lcfg = []
         for lt in c["layer_types"]:
