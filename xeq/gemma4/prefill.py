@@ -490,17 +490,29 @@ class Prefill:
         if self.amm:
             from ..qwen35 import prefill as QP
             gc = dict(QP.GCFG); gc.update(WM=8, UK=2)
-            self.gpm = cl.Program(m.ctx, QP.GSRC).build(options=[f"-D{k}={v}" for k, v in gc.items()] + [f"-DG={m.meta['G']}", "-DXE8=1", "-DNODEC=0", "-DIB=1", "-cl-intel-256-GRF-per-thread"] + QP._nosplit(m.q.device) + QP._slmbw())
+            # 2: one pass (row offset, unnormalized BF16 P, exact fallback on overflow); 1: exact two passes; 0: score matrix + softPg
+            self.att2 = int(knob("G4_ATT2", "0"))   # off by default until checked against BF16 on translation / writing text
+            self.att2_min = int(knob("G4_ATT2_MIN", "2048"))   # key range from which the new path is used (smaller S stays in cache)
+            from ..qwen35.attn2_src import ATT2_FAST, ATT2_EXACT, ATT2_GSRC
+            gopts = [f"-D{k}={v}" for k, v in gc.items()] + [f"-DG={m.meta['G']}", "-DXE8=1", "-DNODEC=0", "-DIB=1", "-cl-intel-256-GRF-per-thread"] + QP._nosplit(m.q.device) + QP._slmbw()
+            self.gpm = cl.Program(m.ctx, QP.GSRC + (ATT2_FAST if self.att2 == 2 else "")).build(options=gopts)
+            self.gpx = cl.Program(m.ctx, QP.GSRC + ATT2_EXACT).build(options=gopts) if self.att2 else None
             zb = bytes(self.gpm.get_info(cl.program_info.BINARIES)[0]); i = zb.find(("name:            pgemm" + chr(10)).encode()); j = zb.find(b"- name:", i + 10)
             self.amm_nofuse = b"require_disable_eufusion: true" in zb[i:j if j > 0 else len(zb)]
             if self.amm_nofuse:
                 print("warning: attention pgemm was built with EU fusion disabled", flush=True)
-            self.pam = cl.Program(m.ctx, GR.KVM + AMSRC).build()
+            self.pam = cl.Program(m.ctx, GR.KVM + AMSRC + (ATT2_GSRC if self.att2 else "")).build(
+                options=[f"-DOFFADJ={knob('G4_OFFADJ')}.0f"] if knob("G4_OFFADJ") else [])
             self.ATR, self.ATC, self.ans = 8 * gc["RM"] * gc["WM"], 8 * gc["NT"] * gc["WN"], gc["WM"] * gc["WN"]
             self.RB = 1024; self.LPM = -(-(m.TM + self.T) // 128) * 128
             bb = lambda n: cl.Buffer(m.ctx, mf.READ_WRITE, int(n))
             self.aq, self.bk, self.bv = bb(self.RB * 512 * 2), bb(self.LPM * 512 * 2), bb(self.LPM * 512 * 2)
-            self.Sm, self.ap, self.ot = bb(self.RB * self.LPM * 4), bb(self.RB * self.LPM * 2), bb(self.RB * 512 * 4)
+            self.chk = knob("G4_CHK") == "1"
+            self.Sm, self.ap, self.ot = bb(max(4, self.RB * (min(self.LPM, self.att2_min) if self.att2 and not self.chk else self.LPM) * 4)), bb(self.RB * self.LPM * 2), bb(self.RB * 512 * 4)
+            if self.att2:
+                self.aMX, self.aINV, self.aGR, self.aOFF = bb(self.RB * 4), bb(self.RB * 4), bb(self.RB * 4), bb(self.RB * 4)
+                self.aKN, self.aPS, self.aFLAG, self.aONE = bb(self.LPM * 4), bb(self.RB * self.LPM // 32 * 4), bb(4), bb(4)
+                cl.enqueue_fill_buffer(m.q, self.aONE, np.int32(1), 0, 4)
         self.NP = m.TM + self.T
         self.SMAP = cl.Buffer(m.ctx, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf=np.full(self.NP, -1, np.int32))
         self.UB = cl.Buffer(m.ctx, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf=np.zeros(self.NP, np.int32))
@@ -633,7 +645,12 @@ class Prefill:
         q = q or m.q; jhi = pos0 + Tn; jlo = max(0, pos0 + 1 - L["WIN"]); Lp = -(-(jhi - jlo) // 128) * 128; R = Tn * GQ
         RB = min(self.RB, -(-R // self.ATR) * self.ATR); ns = self.ans
         if not hasattr(self, "akc"):
-            self.akc = {n: cl.Kernel(self.pam, n) for n in ("packKg", "packVg", "packQg", "softPg", "writeOg")}; self.akg = cl.Kernel(self.gpm, "pgemm")
+            names = ("packKg", "packVg", "packQg", "softPg", "writeOg") + (("knormg", "rowoffg", "rowsumg", "writeOg2") if self.att2 else ())
+            self.akc = {n: cl.Kernel(self.pam, n) for n in names}; self.akg = cl.Kernel(self.gpm, "pgemm")
+            if self.att2:
+                self.akc.update({n: cl.Kernel(self.gpx, n) for n in ("qkstat", "qkp")})
+                if self.att2 == 2:
+                    self.akc["qke"] = cl.Kernel(self.gpm, "qke")
         kg = self.akg
 
         def go(name, g, l, *args):
@@ -649,7 +666,7 @@ class Prefill:
                 go("packKg", (Lp, HD // 2), None, kc, self.bk, I(KH), I(kh), I(HD), I(jlo), I(jhi), I(L["CAP"]))
                 go("packVg", (HD, Lp // 2), None, vc, self.bv, I(KH), I(kh), I(HD), I(jlo), I(jhi), I(L["CAP"]), I(Lp // 16))
             for rb0 in range(0, R, RB):
-                jl, Lq = jlo, Lp
+                jl, Lq, jh = jlo, Lp, jhi
                 if band:
                     t_first, t_last = pos0 + rb0 // GQ, pos0 + (min(R, rb0 + RB) - 1) // GQ
                     jl = max(jlo, t_first + 1 - L["WIN"]); jh = min(jhi, t_last + 1)
@@ -658,16 +675,57 @@ class Prefill:
                     go("packKg", (Lq, HD // 2), None, kc, self.bk, I(KH), I(kh), I(HD), I(jl), I(jh), I(L["CAP"]))
                     go("packVg", (HD, Lq // 2), None, vc, self.bv, I(KH), I(kh), I(HD), I(jl), I(jh), I(L["CAP"]), I(Lq // 16))
                 go("packQg", (HD // 2, RB), None, self.Qb, self.aq, I(NH), I(kh), I(GQ), I(HD), I(rb0), I(R))
-                kg.set_args(self.aq, self.bk, self.Sm, I(RB), I(Lq), I(HD), I(Lq), I(0))
-                e = cl.enqueue_nd_range_kernel(q, kg, (Lq // self.ATC * ns * 8, RB // self.ATR), (ns * 8, 1))
-                if evs is not None:
-                    evs.append(("attn.QK", e))
-                go("softPg", (RB * 256,), (256,), self.Sm, I(Lq), self.ap, I(pos0), I(rb0), I(R), I(GQ), I(jl), I(L["WIN"]), self.UB, I(0 if L["kv"] else 1))
+                bid = I(0 if L["kv"] else 1)
+                new = self.att2 and Lq >= self.att2_min
+                if new:
+                    ra = (I(R), I(pos0), I(rb0), I(GQ), I(jl), I(L["WIN"]), self.UB, bid if self.spans else I(0), np.float32(1.0))   # UB is all zero without images
+                    gate = self.aONE
+                    if self.att2 == 2:
+                        go("knormg", (-(-Lq // 256) * 256,), (256,), kc, I(KH), I(kh), I(HD), I(jl), I(jh), I(L["CAP"]), I(Lq), self.aKN)
+                        go("rowoffg", (RB,), (256,), self.Qb, kc, self.aKN, I(NH), I(KH), I(kh), I(GQ), I(HD), I(L["CAP"]), I(Lq), I(pos0), I(rb0), I(R), self.aOFF)
+                        go("qke", (Lq // self.ATC * ns * 8, RB // self.ATR), (ns * 8, 1), self.aq, self.bk, I(Lq), I(HD), *ra, self.aOFF, self.ap, self.aPS)
+                        cl.enqueue_fill_buffer(q, self.aFLAG, np.int32(0), 0, 4)
+                        go("rowsumg", (RB,), (256,), self.aPS, I(Lq // 32), I(rb0), I(R), self.aGR, self.aFLAG)
+                        gate = self.aFLAG
+                    go("qkstat", (ns * 8, RB // self.ATR), (ns * 8, 1), self.aq, self.bk, I(Lq), I(HD), *ra, self.aMX, self.aINV, gate, self.aGR)
+                    go("qkp", (Lq // self.ATC * ns * 8, RB // self.ATR), (ns * 8, 1), self.aq, self.bk, I(Lq), I(HD), *ra, self.aMX, self.aINV, self.ap, gate)
+                    if self.chk:
+                        self._chk(q, kg, i, kh, rb0, RB, Lq, HD, pos0, R, GQ, jl, L, bid, ns)
+                else:
+                    kg.set_args(self.aq, self.bk, self.Sm, I(RB), I(Lq), I(HD), I(Lq), I(0))
+                    e = cl.enqueue_nd_range_kernel(q, kg, (Lq // self.ATC * ns * 8, RB // self.ATR), (ns * 8, 1))
+                    if evs is not None:
+                        evs.append(("attn.QK", e))
+                    go("softPg", (RB * 256,), (256,), self.Sm, I(Lq), self.ap, I(pos0), I(rb0), I(R), I(GQ), I(jl), I(L["WIN"]), self.UB, bid)
                 kg.set_args(self.ap, self.bv, self.ot, I(RB), I(HD), I(Lq), I(HD), I(0))
                 e = cl.enqueue_nd_range_kernel(q, kg, (HD // self.ATC * ns * 8, RB // self.ATR), (ns * 8, 1))
                 if evs is not None:
                     evs.append(("attn.PV", e))
-                go("writeOg", (HD, RB), None, self.ot, self.Ab, I(NH), I(kh), I(GQ), I(HD), I(rb0), I(R))
+                if new:
+                    go("writeOg2", (HD, RB), None, self.ot, self.aGR, self.Ab, I(NH), I(kh), I(GQ), I(HD), I(rb0), I(R))
+                else:
+                    go("writeOg", (HD, RB), None, self.ot, self.Ab, I(NH), I(kh), I(GQ), I(HD), I(rb0), I(R))
+
+    def _chk(self, q, kg, i, kh, rb0, RB, Lq, HD, pos0, R, GQ, jl, L, bid, ns):
+        I = np.int32; n = RB * Lq
+        pn = np.empty(n, np.uint16); cl.enqueue_copy(q, pn, self.ap); gr = np.empty(RB, np.float32); cl.enqueue_copy(q, gr, self.aGR)
+        kg.set_args(self.aq, self.bk, self.Sm, I(RB), I(Lq), I(HD), I(Lq), I(0))
+        cl.enqueue_nd_range_kernel(q, kg, (Lq // self.ATC * ns * 8, RB // self.ATR), (ns * 8, 1))
+        k = self.akc["softPg"]; k.set_args(self.Sm, I(Lq), self.ap, I(pos0), I(rb0), I(R), I(GQ), I(jl), I(L["WIN"]), self.UB, bid)
+        cl.enqueue_nd_range_kernel(q, k, (RB * 256,), (256,))
+        po = np.empty(n, np.uint16); cl.enqueue_copy(q, po, self.ap); q.finish()
+        f = lambda u: (u.astype(np.uint32) << 16).view(np.float32)
+        # unpack: block (r/8, c/16) of 64 uints = 128 halves; uint index (r%8)*8 + c2%8, c2 = c/2
+        def unpack(u):
+            x = f(u).reshape(RB // 8, Lq // 16, 8, 8, 2)                     # [rb][kb][r%8][c2%8][pair]
+            return x.transpose(0, 2, 1, 3, 4).reshape(RB, Lq)
+        a, b = unpack(pn), unpack(po)
+        if self.att2 == 2:
+            a = a * gr[:, None]
+        d = np.abs(a - b); rows = min(RB, R - rb0)
+        nzo, nzn = (b[:rows] != 0).sum(), (a[:rows] != 0).sum()
+        print(f"chk layer {i} kh {kh} rb0 {rb0} Lq {Lq} jl {jl} WIN {L['WIN']}: max|d| {d[:rows].max():.3e} rel {(d[:rows].max() / max(b[:rows].max(), 1e-30)):.3e} "
+              f"nonzero old {nzo} new {nzn} rowsum old {b[:rows].sum(1).min():.4f}..{b[:rows].sum(1).max():.4f} new {a[:rows].sum(1).min():.4f}..{a[:rows].sum(1).max():.4f}", flush=True)
 
     def chunk(self, i0, Tn, pos0, q=None, evs=None):
         """Feeds ids[i0 : i0+Tn] at positions pos0.. . Afterwards TN holds the final normed hidden states [Tn, H]."""

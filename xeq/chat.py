@@ -23,7 +23,15 @@ class Chat:
             raise SystemExit(f"tokenizer.json and chat_template.jinja not found in {folder} or its parent folder")
         self.family = family
         self.tk = Tokenizer.from_file(os.path.join(folder, "tokenizer.json"))
-        env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=[jinja2.ext.loopcontrols])
+        class Generation(jinja2.ext.Extension):
+            """{% generation %} ... {% endgeneration %} (marks the assistant text for training masks): rendered as its content."""
+            tags = {"generation"}
+
+            def parse(self, parser):
+                lineno = next(parser.stream).lineno
+                body = parser.parse_statements(("name:endgeneration",), drop_needle=True)
+                return jinja2.nodes.Scope(body, lineno=lineno)
+        env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=[jinja2.ext.loopcontrols, Generation])
 
         def raise_exception(msg):
             raise jinja2.exceptions.TemplateError(msg)

@@ -13,9 +13,9 @@ python -m xeq <command> ...
 <model> is a model folder (or a .bin in it) holding the XeFP4 .bin/.json pair, tokenizer.json and chat_template.jinja.
 Options: --ctx N (KV cache length), -n N (max new tokens), --think (reasoning on), --system TEXT,
          --image FILE (Gemma 4, repeatable; loads the vision encoder), --no-mtp (plain decoding),
-         --kv fp16|fp32 (Gemma 4 KV cache, default fp16; fp32 doubles the KV memory),
+         --kv fp16|fp32 (KV cache, default fp16; fp32 doubles the KV memory),
          --prefill-chunk auto|small|N (prompt tokens per prefill pass; auto = 2048 where it helps and fits:
-         Qwen3.5 always, Gemma 4 on GPUs with 20 GiB or more; small = 512 / 1024, less memory).
+         Qwen 9B always, Qwen 27B and Gemma 4 on GPUs with 20 GiB or more, else 1024 (27B) or 512 (Gemma); small = 512 / 1024, less memory).
 Sampling (default greedy): --temperature T --top-p P --top-k K --min-p P --presence-penalty X --repetition-penalty X --seed N"""
 from __future__ import annotations
 

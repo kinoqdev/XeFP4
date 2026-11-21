@@ -122,7 +122,12 @@ def serve(eng, chat, host, port, name):
                   f"max {mx}, thinking {'on' if think else 'off'}, stream {stream}" + (f", sampling {samp}" if samp else ""), flush=True)
 
             def finish(out):
-                r, c, calls = chat.split(chat.decode(out), think)
+                raw = chat.decode(out)
+                import os
+                if os.environ.get("XEQ_SERVE_RAW"):                  # debug: raw model output per request (JSON lines)
+                    with open(os.environ["XEQ_SERVE_RAW"], "a", encoding="utf-8") as fh:
+                        fh.write(json.dumps({"id": cid, "messages": len(req["messages"]), "raw": raw}, ensure_ascii=False) + "\n")
+                r, c, calls = chat.split(raw, think)
                 tcs = [{"id": "call_" + uuid.uuid4().hex[:20], "type": "function", "function": {"name": n, "arguments": json.dumps(a, ensure_ascii=False)}} for n, a in calls]
                 return r, c, tcs
 

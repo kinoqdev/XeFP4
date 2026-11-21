@@ -275,7 +275,7 @@ __kernel void dnetB(__global const float* Cx, int C, int KD, __global const floa
         out[VH * 128 + h * 128 + d] = o1 * rsqrt(ms1 + eps) * g * siluB(p1[ZO + h * 128 + d]);
     }
 }
-__kernel void attnprep2(__global const float* P, int ldp, __global const float* qn, __global const float* kn, __global float* Q, __global float* kc, __global float* vc,
+__kernel void attnprep2(__global const float* P, int ldp, __global const float* qn, __global const float* kn, __global float* Q, __global KT* kc, __global KT* vc,
                         __global const int* pb, float theta, int NH, int KH, int RD, float eps, int plus1) {
     __local float r[256], sh[256];
     int g = get_group_id(0), t = get_group_id(1), d = get_local_id(0), pos = pb[0] + t;
@@ -293,9 +293,9 @@ __kernel void attnprep2(__global const float* P, int ldp, __global const float* 
         y = d < hr ? sh[d] * c - sh[d + hr] * s : sh[d] * c + sh[d - hr] * s;
     }
     if (g < NH) Q[((size_t)t * NH + g) * 256 + d] = y;
-    else { size_t o = ((size_t)pos * KH + (g - NH)) * 256 + d; kc[o] = y; vc[o] = p[NH * 512 + KH * 256 + (g - NH) * 256 + d]; }
+    else { size_t o = ((size_t)pos * KH + (g - NH)) * 256 + d; KST(y, o, kc); KST(p[NH * 512 + KH * 256 + (g - NH) * 256 + d], o, vc); }
 }
-__kernel void attn2(__global const float* Q, __global const float* kc, __global const float* vc, __global const float* P, int ldp, __global float* A,
+__kernel void attn2(__global const float* Q, __global const KT* kc, __global const KT* vc, __global const float* P, int ldp, __global float* A,
                     __global float* sc, __global const int* pb, int TM, int KH, int GQ) {
     __local float sq[256], r[256];
     int h = get_group_id(0), t = get_group_id(1), l = get_local_id(0), NH = get_num_groups(0), kh = h / GQ;
@@ -304,8 +304,8 @@ __kernel void attn2(__global const float* Q, __global const float* kc, __global 
     sq[l] = Q[((size_t)t * NH + h) * 256 + l]; barrier(CLK_LOCAL_MEM_FENCE);
     float mx = -INFINITY;
     for (int j = l; j < L; j += 256) {
-        __global const float* kr = kc + ((size_t)j * KH + kh) * 256; float s = 0.0f;
-        for (int i = 0; i < 256; i += 4) s += dot(vload4(0, sq + i), vload4(0, kr + i));
+        __global const KT* kr = kc + ((size_t)j * KH + kh) * 256; float s = 0.0f;
+        for (int i = 0; i < 256; i += 4) s += dot(vload4(0, sq + i), KLD4(0, kr + i));
         s *= 0.0625f; s_[j] = s; mx = fmax(mx, s);
     }
     r[l] = mx; barrier(CLK_LOCAL_MEM_FENCE);
@@ -316,7 +316,7 @@ __kernel void attn2(__global const float* Q, __global const float* kc, __global 
     sum = wsumB(sum, r);
     barrier(CLK_GLOBAL_MEM_FENCE);
     float o = 0.0f;
-    for (int j = 0; j < L; j++) o += s_[j] * vc[((size_t)j * KH + kh) * 256 + l];
+    for (int j = 0; j < L; j++) o += s_[j] * KLD1(((size_t)j * KH + kh) * 256 + l, vc);
     float gt = P[(size_t)t * ldp + h * 512 + 256 + l];
     A[((size_t)t * NH + h) * 256 + l] = o / sum / (1.0f + exp(-gt));
 }
@@ -355,14 +355,14 @@ class Spec:
         self._pfx = "B:" 
         c, H, F, I, eps = m.cfg, m.H, m.F, np.int32, np.float32(m.eps)
         G = m.meta["G"]; xe8 = int(m.meta["fmt"] == "xe8")
-        opt = [f"-DG={G}", f"-DXE8={xe8}", "-DR=1", "-DDB=64", f"-DNP={m.np_}"]
+        opt = [f"-DG={G}", f"-DXE8={xe8}", "-DR=1", "-DDB=64", f"-DNP={m.np_}", f"-DQPG={m.GQ}"] + (["-DKV16"] if m.kv16 else [])
         import os
         self.bp = cl.Program(m.ctx, SRC + BSRC).build(options=opt + ["-DRB=1"])
         rb = dict(zip(("proj", "out", "gu", "down"), (int(x) for x in knob("Q35_SRB", "4,2,4,2").split(","))))
         self.rb = rb
         self.bpr = {r: (self.bp if r == 1 else cl.Program(m.ctx, SRC + BSRC).build(options=opt + [f"-DRB={r}"])) for r in sorted(set(rb.values()))}
         self.gvk = knob("Q35_SGV", "gemvB4")
-        self.cp = cp = {r: cl.Program(m.ctx, SRC).build(options=[f"-DG={G}", f"-DXE8={xe8}", f"-DR={r}", "-DDB=64", f"-DNP={m.np_}", "-DCOND", "-DPOSB"]) for r in (1, 2)}
+        self.cp = cp = {r: cl.Program(m.ctx, SRC).build(options=[f"-DG={G}", f"-DXE8={xe8}", f"-DR={r}", "-DDB=64", f"-DNP={m.np_}", "-DCOND", "-DPOSB", f"-DQPG={m.GQ}"] + (["-DKV16"] if m.kv16 else [])) for r in (1, 2)}
         mf = cl.mem_flags
         f32 = lambda n: cl.Buffer(m.ctx, mf.READ_WRITE, max(4, int(n) * 4))
         self.i32 = lambda n: cl.Buffer(m.ctx, mf.READ_WRITE, max(4, int(n) * 4))
@@ -407,7 +407,7 @@ class Spec:
                              self.POS, np.float32(m.theta), I(m.NH), I(m.KH), I(m.RD), eps, I(m.qp1)))
                 if m.fa:
                     if knob("Q35_FATTN2", "1") == "1":
-                        ks.append(list(self._k(cp[1], "fattn2", (m.KH * 128, m.SM, 1), (128, 1, 1), self.Q2, kc, vc, self.PM2, self.PL2, self.PO2, I(0), I(m.KH), I(m.SM), I(m.CH),
+                        ks.append(list(self._k(cp[1], "fattn2", (m.KH * m.ALS, m.SM, 1), (m.ALS, 1, 1), self.Q2, kc, vc, self.PM2, self.PL2, self.PO2, I(0), I(m.KH), I(m.SM), I(m.CH),
                                                self.POS, self.FLAG, I(-1), label="B:attn2")))
                     else:
                         ks.append(list(self._k(cp[1], "fattn", (m.KH * 128, m.SM, 2), (128, 1, 1), self.Q2, kc, vc, self.PM2, self.PL2, self.PO2, I(0), I(m.KH), I(m.SM), I(m.CH),

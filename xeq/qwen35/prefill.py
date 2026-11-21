@@ -326,6 +326,23 @@ __kernel void pgemm8t(__global const uint* A, __global const float* SAt, int Mp,
 """
 
 PSRC = r"""
+#ifdef KV16
+#define KT half
+#define KLD16(o, p) vload_half16(o, p)
+#define KLD4(o, p) vload_half4(o, p)
+#define KLD1(o, p) vload_half(o, p)
+#define KST(v, o, p) vstore_half(v, o, p)
+#else
+#define KT float
+#define KLD16(o, p) vload16(o, p)
+#define KLD4(o, p) vload4(o, p)
+#define KLD1(o, p) ((p)[o])
+#define KST(v, o, p) ((p)[o] = (v))
+#endif
+
+#ifndef QPG
+#define QPG 4
+#endif
 #define UNR __attribute__((opencl_unroll_hint))
 inline uint bf16(float f) { uint u = as_uint(f); return (u + 0x7FFFu + ((u >> 16) & 1u)) >> 16; }
 inline float wsum(float v, __local float* r) {
@@ -455,7 +472,7 @@ __kernel void gnormT(__global const float* O, __global const float* P, int ldp, 
     float ms = wsum(o * o, r) / 128.0f; float z = P[(size_t)t * ldp + ZO + h * 128 + d];
     A[(size_t)t * VH * 128 + h * 128 + d] = o * rsqrt(ms + eps) * (gplus1 ? 1.0f + gw[d] : gw[d]) * silu(z);
 }
-__kernel void attnprepT(__global const float* P, int ldp, __global const float* qn, __global const float* kn, __global float* Q, __global float* kc, __global float* vc,
+__kernel void attnprepT(__global const float* P, int ldp, __global const float* qn, __global const float* kn, __global float* Q, __global KT* kc, __global KT* vc,
                         int pos0, float theta, int NH, int KH, int RD, float eps, int plus1) {
     __local float r[256], sh[256];
     int g = get_group_id(0), t = get_group_id(1), d = get_local_id(0), pos = pos0 + t;
@@ -473,9 +490,9 @@ __kernel void attnprepT(__global const float* P, int ldp, __global const float* 
         y = d < hr ? sh[d] * c - sh[d + hr] * s : sh[d] * c + sh[d - hr] * s;
     }
     if (g < NH) Q[((size_t)t * NH + g) * 256 + d] = y;
-    else { size_t o = ((size_t)pos * KH + (g - NH)) * 256 + d; kc[o] = y; vc[o] = p[NH * 512 + KH * 256 + (g - NH) * 256 + d]; }
+    else { size_t o = ((size_t)pos * KH + (g - NH)) * 256 + d; KST(y, o, kc); KST(p[NH * 512 + KH * 256 + (g - NH) * 256 + d], o, vc); }
 }
-__kernel void attnT(__global const float* Q, __global const float* kc, __global const float* vc, __global const float* P, int ldp, __global float* A,
+__kernel void attnT(__global const float* Q, __global const KT* kc, __global const KT* vc, __global const float* P, int ldp, __global float* A,
                     __global float* sc, int pos0, int TT, int KH, int GQ) {
     __local float sq[256], r[256];
     int h = get_group_id(0), t = get_group_id(1), l = get_local_id(0), NH = get_num_groups(0), kh = h / GQ;
@@ -484,8 +501,8 @@ __kernel void attnT(__global const float* Q, __global const float* kc, __global 
     sq[l] = Q[((size_t)t * NH + h) * 256 + l]; barrier(CLK_LOCAL_MEM_FENCE);
     float mx = -INFINITY;
     for (int j = l; j < L; j += 256) {
-        __global const float* kr = kc + ((size_t)j * KH + kh) * 256; float s = 0.0f;
-        for (int i = 0; i < 256; i += 4) s += dot(vload4(0, sq + i), vload4(0, kr + i));
+        __global const KT* kr = kc + ((size_t)j * KH + kh) * 256; float s = 0.0f;
+        for (int i = 0; i < 256; i += 4) s += dot(vload4(0, sq + i), KLD4(0, kr + i));
         s *= 0.0625f; s_[j] = s; mx = fmax(mx, s);
     }
     r[l] = mx; barrier(CLK_LOCAL_MEM_FENCE);
@@ -496,7 +513,7 @@ __kernel void attnT(__global const float* Q, __global const float* kc, __global 
     sum = wsum(sum, r);
     barrier(CLK_GLOBAL_MEM_FENCE);
     float o = 0.0f;
-    for (int j = 0; j < L; j++) o += s_[j] * vc[((size_t)j * KH + kh) * 256 + l];
+    for (int j = 0; j < L; j++) o += s_[j] * KLD1(((size_t)j * KH + kh) * 256 + l, vc);
     float gt = P[(size_t)t * ldp + h * 512 + 256 + l];
     A[((size_t)t * NH + h) * 256 + l] = o / sum / (1.0f + exp(-gt));
 }
@@ -512,24 +529,30 @@ __kernel void quantA8(__global const float* X, int ldx, __global uint* A8, __glo
 }
 __attribute__((intel_reqd_sub_group_size(16)))
 __kernel void rmsq8(__global const float* X, __global const float* w, int H, float eps, int plus1, __global uint* A8, __global float* SAt, int Mp, int T) {
-    // rmsnormT + quantA8 in one pass (H == 4096: one float4 per thread). The sum uses rmsnormT's order, so the
-    // normalized values and therefore the INT8 codes are the same bits as the two-kernel path.
+    // rmsnormT + quantA8 in one pass (4096 <= H <= 8192: thread l handles float4 l and, if present, l + 1024). The sum
+    // uses rmsnormT's order, so the normalized values and therefore the INT8 codes are the same bits as the two-kernel path.
     __local float r[64]; __local float tot;
-    int l = get_local_id(0), t = get_group_id(1), KB = H / 32, b = l >> 3;
-    __global uint* o = A8 + ((size_t)(t / 8) * KB + b) * 64 + (t % 8) * 8 + (l & 7);
-    float4 v = t < T ? vload4(l, X + (size_t)t * H) : (float4)(0.0f);
-    float s = sub_group_reduce_add(dot(v, v));
+    int l = get_local_id(0), t = get_group_id(1), KB = H / 32, n4 = H / 4, two = l + 1024 < n4;
+    __global const float* x = X + (size_t)t * H;
+    float4 v0 = t < T ? vload4(l, x) : (float4)(0.0f), v1 = (two && t < T) ? vload4(l + 1024, x) : (float4)(0.0f);
+    float s = dot(v0, v0); if (two) s += dot(v1, v1);
+    s = sub_group_reduce_add(s);
     if (get_sub_group_local_id() == 0) r[get_sub_group_id()] = s;
     barrier(CLK_LOCAL_MEM_FENCE);
     if (get_sub_group_id() == 0) { int j = get_sub_group_local_id(); float q = r[j] + r[j + 16] + r[j + 32] + r[j + 48]; q = sub_group_reduce_add(q); if (j == 0) tot = q; }
     barrier(CLK_LOCAL_MEM_FENCE);
-    float k = rsqrt(tot / H + eps); float4 g = vload4(l, w);
-    float4 y = v * k * (plus1 ? 1.0f + g : g);
-    float4 a = fabs(y); float mx = fmax(fmax(a.x, a.y), fmax(a.z, a.w));
-    mx = fmax(mx, intel_sub_group_shuffle_xor(mx, 1u)); mx = fmax(mx, intel_sub_group_shuffle_xor(mx, 2u)); mx = fmax(mx, intel_sub_group_shuffle_xor(mx, 4u));
-    float sc = mx > 0.0f ? mx / 127.0f : 1.0f;
-    *o = as_uint(convert_char4_sat_rte(y * (1.0f / sc)));
-    if ((l & 7) == 0) SAt[(size_t)b * Mp + t] = sc;
+    float k = rsqrt(tot / H + eps);
+    for (int part = 0; part < 2; part++) {
+        if (part == 1 && !two) break;                                  // uniform per sub-group (n4 - 1024 is a multiple of 16)
+        int i = l + part * 1024, b = i >> 3;
+        float4 g = vload4(i, w), v = part ? v1 : v0;
+        float4 y = v * k * (plus1 ? 1.0f + g : g);
+        float4 a = fabs(y); float mx = fmax(fmax(a.x, a.y), fmax(a.z, a.w));
+        mx = fmax(mx, intel_sub_group_shuffle_xor(mx, 1u)); mx = fmax(mx, intel_sub_group_shuffle_xor(mx, 2u)); mx = fmax(mx, intel_sub_group_shuffle_xor(mx, 4u));
+        float sc = mx > 0.0f ? mx / 127.0f : 1.0f;
+        A8[((size_t)(t / 8) * KB + b) * 64 + (t % 8) * 8 + (i & 7)] = as_uint(convert_char4_sat_rte(y * (1.0f / sc)));
+        if ((i & 7) == 0) SAt[(size_t)b * Mp + t] = sc;
+    }
 }
 __kernel void swq8(__global const float* GU, int F, __global uint* A8, __global float* SAt, int Mp, int T) {
     // swigluT + quantA8 for the down projection in one pass: same float values as silu(g) * u written to M and re-read.
@@ -549,26 +572,26 @@ __kernel void swq8(__global const float* GU, int F, __global uint* A8, __global 
 }
 __kernel void packQ(__global const float* Q, __global uint* Aq, int NH, int kh) {
     int c2 = get_global_id(0), r = get_global_id(1);
-    int t = r >> 2, g = r & 3; __global const float* q = Q + ((size_t)t * NH + kh * 4 + g) * 256;
+    int t = r / QPG, g = r % QPG; __global const float* q = Q + ((size_t)t * NH + kh * QPG + g) * 256;
     Aq[((size_t)(r / 8) * 16 + c2 / 8) * 64 + (r % 8) * 8 + c2 % 8] = bf16(q[2 * c2]) | (bf16(q[2 * c2 + 1]) << 16);
 }
-__kernel void packK(__global const float* kc, __global uint* Bk, int KH, int kh, int L) {
+__kernel void packK(__global const KT* kc, __global uint* Bk, int KH, int kh, int L) {
     int n = get_global_id(0), c2 = get_global_id(1);
     uint pr = 0;
-    if (n < L) { __global const float* k = kc + ((size_t)n * KH + kh) * 256; pr = bf16(k[2 * c2]) | (bf16(k[2 * c2 + 1]) << 16); }
+    if (n < L) { __global const KT* k = kc + ((size_t)n * KH + kh) * 256; pr = bf16(KLD1(2 * c2, k)) | (bf16(KLD1(2 * c2 + 1, k)) << 16); }
     Bk[((size_t)(n / 8) * 16 + c2 / 8) * 64 + (c2 % 8) * 8 + n % 8] = pr;
 }
-__kernel void packVT(__global const float* vc, __global uint* Bv, int KH, int kh, int L, int KB) {
+__kernel void packVT(__global const KT* vc, __global uint* Bv, int KH, int kh, int L, int KB) {
     int n = get_global_id(0), p2 = get_global_id(1);
     int p = 2 * p2; float a = 0.0f, b = 0.0f;
-    if (p < L) a = vc[((size_t)p * KH + kh) * 256 + n];
-    if (p + 1 < L) b = vc[((size_t)(p + 1) * KH + kh) * 256 + n];
+    if (p < L) a = KLD1(((size_t)p * KH + kh) * 256 + n, vc);
+    if (p + 1 < L) b = KLD1(((size_t)(p + 1) * KH + kh) * 256 + n, vc);
     Bv[((size_t)(n / 8) * KB + p2 / 8) * 64 + (p2 % 8) * 8 + n % 8] = bf16(a) | (bf16(b) << 16);
 }
 __kernel void softP(__global const float* S, int Lp, __global uint* Ap, int pos0, int R) {
     __local float red[256];
     int r = get_group_id(0), l = get_local_id(0), KB = Lp / 16;
-    int Lr = r < R ? pos0 + (r >> 2) + 1 : 0;
+    int Lr = r < R ? pos0 + r / QPG + 1 : 0;
     __global const float* s = S + (size_t)r * Lp;
     float mx = -INFINITY;
     for (int j = l; j < Lr; j += 256) mx = fmax(mx, s[j] * 0.0625f);
@@ -586,7 +609,7 @@ __kernel void softP(__global const float* S, int Lp, __global uint* Ap, int pos0
     }
 }
 __kernel void gateO(__global const float* O, __global const float* P, int ldp, __global float* A, int NH, int kh) {
-    int d = get_global_id(0), r = get_global_id(1), t = r >> 2, g = r & 3, h = kh * 4 + g;
+    int d = get_global_id(0), r = get_global_id(1), t = r / QPG, g = r % QPG, h = kh * QPG + g;
     float gt = P[(size_t)t * ldp + h * 512 + 256 + d];
     A[((size_t)t * NH + h) * 256 + d] = O[(size_t)r * 256 + d] / (1.0f + exp(-gt));
 }
@@ -603,7 +626,11 @@ class Prefill:
     def __init__(self, m: Model, tmax=None):
         import os
         # 2048-token chunks (prefill +7-13% on the A770 and 140T; about +1.1 GiB at a 32K context).
-        tmax = tmax or int(knob("Q35_PCHUNK", "2048"))
+        # A large model on a smaller GPU (27B on a 16 GB card) uses 1024: fits the Arc A770 at an 8K context with MTP
+        # (2048 does not: 15.58 of 15.56 GiB) and is +24% over 512 there.
+        wbytes = sum(t["nbytes"] for t in m.tm.values())
+        auto = "2048" if (m.q.device.global_mem_size >= 20 * 2**30 or wbytes < 8 * 2**30) else "1024"
+        tmax = tmax or int(knob("Q35_PCHUNK", auto))
         self.m = m
         ctx = m.ctx
         import os
@@ -613,17 +640,23 @@ class Prefill:
         if knob("Q35_PCFG"):
             gc.update(zip(("RM", "NT", "WM", "WN", "UK"), (int(x) for x in os.environ["Q35_PCFG"].split(","))))
         self.gcfg = gc
-        self.gp = cl.Program(ctx, GSRC).build(options=[f"-D{k}={v}" for k, v in gc.items()] + [f"-DG={m.meta['G']}", f"-DXE8={int(m.meta['fmt'] == 'xe8')}", "-DNODEC=0", f"-DIB={self.ib}", "-cl-intel-256-GRF-per-thread"] + _nosplit(m.q.device) + _slmbw())
+        # attention without the FP32 score matrix: 2 = one pass (row offset, unnormalized BF16 P, exact two-pass fallback on overflow),
+        # 1 = exact two passes (row max / sum, then P), 0 = score matrix + softP
+        self.att2 = int(knob("Q35_ATT2", "2"))
+        from .attn2_src import ATT2_FAST, ATT2_EXACT, ATT2_PSRC
+        gopts = [f"-D{k}={v}" for k, v in gc.items()] + [f"-DG={m.meta['G']}", f"-DXE8={int(m.meta['fmt'] == 'xe8')}", "-DNODEC=0", f"-DIB={self.ib}", f"-DQPG={m.GQ}", "-cl-intel-256-GRF-per-thread"] + _nosplit(m.q.device) + _slmbw()
+        self.gp = cl.Program(ctx, GSRC + (ATT2_FAST if self.att2 == 2 else "")).build(options=gopts)
+        self.gpx = cl.Program(ctx, GSRC + ATT2_EXACT).build(options=gopts) if self.att2 else None
         self.kg4 = cl.Kernel(self.gp, "pgemm4")
         self.a8 = int(knob("Q35_A8", "1" if m.meta["fmt"] == "xe8" else "0"))
         self.fuse = int(knob("Q35_FUSE", "1"))   # fused norm/SwiGLU + INT8 quantization
-        self.fq = self.a8 and self.fuse and m.H == 4096          # rmsq8 assumes one float4 per thread (1024 threads)
+        self.fq = self.a8 and self.fuse and 4096 <= m.H <= 8192 and (m.H // 4 - 1024) % 16 == 0   # rmsq8: one or two float4 per thread
         c8 = dict(GCFG); c8.update(zip(("RM", "NT", "WM", "WN", "UK"), (int(x) for x in knob("Q35_P8CFG", "4,4,8,4,1").split(","))))   # K step 32 (A770 +3-4%, 140T +5%)
         self.c8 = c8; self.TR8 = 8 * c8["RM"] * c8["WM"]; self.TC8 = 8 * c8["NT"] * c8["WN"]
         self.gp8 = cl.Program(ctx, GSRC).build(options=[f"-D{k}={v}" for k, v in c8.items()] + [f"-DG={m.meta['G']}", f"-DXE8={int(m.meta['fmt'] == 'xe8')}", "-DNODEC=0", "-DIB=1", "-cl-intel-256-GRF-per-thread"] + _nosplit(m.q.device) + _slmbw())
         self.kg8 = cl.Kernel(self.gp8, "pgemm8")
         self.bt = int(knob("Q35_BT", "-1"))                    # -1: tile B once per GEMM when T >= bt_min (all devices)
-        self.bt_min = int(knob("Q35_BT_MIN", "768")); self.tkeep = {}
+        self.bt_min = int(knob("Q35_BT_MIN", str(min(768, tmax)))); self.tkeep = {}   # never above the chunk size
         self.kg8t = cl.Kernel(self.gp8, "pgemm8t"); self.ktb = cl.Kernel(self.gp8, "tileB8")
         self.gopt = [f"-D{k}={v}" for k, v in gc.items()] + [f"-DG={m.meta['G']}", f"-DXE8={int(m.meta['fmt'] == 'xe8')}", "-cl-intel-256-GRF-per-thread"] + _nosplit(m.q.device)
         zb = bytes(self.gp.get_info(cl.program_info.BINARIES)[0])
@@ -633,7 +666,7 @@ class Prefill:
             i = zb.find(("name:            " + kn + chr(10)).encode()); i = i if i >= 0 else zb.find(("name:            " + kn).encode())
             j = zb.find(b"- name:", i + 10); seg = zb[i:j if j > 0 else len(zb)]
             self.nofuse[kn] = b"require_disable_eufusion: true" in seg
-        self.pp = cl.Program(ctx, PSRC).build(options=[f"-DG={m.meta['G']}", f"-DXE8={int(m.meta['fmt'] == 'xe8')}"])
+        self.pp = cl.Program(ctx, PSRC + (ATT2_PSRC if self.att2 else "")).build(options=([f"-DOFFADJ={knob('Q35_OFFADJ')}.0f"] if knob("Q35_OFFADJ") else []) + [f"-DG={m.meta['G']}", f"-DXE8={int(m.meta['fmt'] == 'xe8')}", f"-DQPG={m.GQ}"] + (["-DKV16"] if m.kv16 else []))
         self.kg = cl.Kernel(self.gp, "pgemm")
         self.TR = 8 * gc["RM"] * gc["WM"]; self.TC = 8 * gc["NT"] * gc["WN"]
         self.Tmax = -(-tmax // self.TR) * self.TR
@@ -643,7 +676,10 @@ class Prefill:
         self.NP = max(m.tm[f"layers.{i}.proj.codes"]["shape"][0] for i in range(c["num_hidden_layers"]))
         kmax = max(t["shape"][1] * 2 for k, t in m.tm.items() if t["kind"] == "codes")
         nmax = max(-(-t["shape"][0] // self.TC) * self.TC for k, t in m.tm.items() if t["kind"] == "codes")
-        self.Bp = cl.Buffer(ctx, mf.READ_WRITE, nmax * kmax * 2)
+        # weight tile scratch: the largest single tensor (INT8 tiles on the W4A8 path, BF16 otherwise), not max N x max K
+        tcm = max(self.TC, 8 * c8["NT"] * c8["WN"])
+        bpe = 1 if self.a8 else 2
+        self.Bp = cl.Buffer(ctx, mf.READ_WRITE, max(-(-t["shape"][0] // tcm) * tcm * t["shape"][1] * 2 * bpe for k, t in m.tm.items() if t["kind"] == "codes"))
         self.Ap = cl.Buffer(ctx, mf.READ_WRITE, Tm * kmax * 2)
         self.SAt = f32(Tm * kmax // 32)
         self.X, self.Xn, self.A = f32(Tm * H), f32(Tm * H), f32(Tm * max(H, m.VH * 128, m.NH * 256))
@@ -655,9 +691,11 @@ class Prefill:
         import os
         self.pfa = int(knob("Q35_PFA", "1"))
         if self.pfa:
-            Mp = -(-4 * Tm // self.TR) * self.TR; Lp = -(-m.TM // 128) * 128
+            Mp = -(-m.GQ * Tm // self.TR) * self.TR; Lp = -(-m.TM // 128) * 128
             self.SC = f32(1); self.aq = cl.Buffer(ctx, mf.READ_WRITE, Mp * 256 * 2); self.bk = cl.Buffer(ctx, mf.READ_WRITE, Lp * 256 * 2)
-            self.bv = cl.Buffer(ctx, mf.READ_WRITE, Lp * 256 * 2); self.Sm = f32(Mp * Lp); self.ap = cl.Buffer(ctx, mf.READ_WRITE, Mp * Lp * 2); self.ot = f32(Mp * 256)
+            self.bv = cl.Buffer(ctx, mf.READ_WRITE, Lp * 256 * 2); self.Sm = f32(1 if self.att2 else Mp * Lp); self.MX, self.INV, self.G, self.OFF = f32(Mp), f32(Mp), f32(Mp), f32(Mp)
+            self.KN, self.PS = f32(m.TM), f32(Mp * Lp // 32); self.FLAG = f32(1); self.ONE = f32(1)
+            cl.enqueue_fill_buffer(m.q, self.ONE, np.int32(1), 0, 4); self.ap = cl.Buffer(ctx, mf.READ_WRITE, Mp * Lp * 2); self.ot = f32(Mp * 256)
         elif m.fa:
             self.SC = f32(1); self.PM, self.PL, self.PO = f32(Tm * m.NH * m.SM), f32(Tm * m.NH * m.SM), f32(Tm * m.NH * m.SM * 256)
         else:
@@ -775,22 +813,48 @@ class Prefill:
     def attn_mm(self, T, pos0, kc, vc, NPl):
         """Per KV head: S = Q K^T -> causal softmax -> O = P V (two BF16 XMX GEMMs) -> output gate."""
         m, I = self.m, np.int32
-        L = pos0 + T; Lp = -(-L // 128) * 128; R = 4 * T; Mp = -(-R // self.TR) * self.TR
+        L = pos0 + T; Lp = -(-L // 128) * 128; R = m.GQ * T; Mp = -(-R // self.TR) * self.TR
         nsg = self.gcfg["WM"] * self.gcfg["WN"]
+        ra = (I(R), I(pos0), I(0), I(m.GQ), I(0), I(1 << 30), self.ONE, I(0), np.float32(0.0625))   # row masks: causal, no window
         for kh in range(m.KH):
-            self.k("packQ", (128, R), None, self.Q, self.aq, I(m.NH), I(kh), label="attnT")
-            self.k("packK", (Lp, 128), None, kc, self.bk, I(m.KH), I(kh), I(L), label="attnT")
-            self.k("packVT", (256, Lp // 2), None, vc, self.bv, I(m.KH), I(kh), I(L), I(Lp // 16), label="attnT")
-            self.kg.set_args(self.aq, self.bk, self.Sm, I(R), I(Lp), I(256), I(Lp), I(0))
-            e = cl.enqueue_nd_range_kernel(m.q, self.kg, (Lp // self.TC * nsg * 8, Mp // self.TR), (nsg * 8, 1))
-            if m.prof:
-                self.ev.append(("attnT", e))
-            self.k("softP", (Mp * 256,), (256,), self.Sm, I(Lp), self.ap, I(pos0), I(R), label="attnT")
+            self.k("packQ", (128, R), None, self.Q, self.aq, I(m.NH), I(kh), label="attnT.pack")
+            self.k("packK", (Lp, 128), None, kc, self.bk, I(m.KH), I(kh), I(L), label="attnT.pack")
+            self.k("packVT", (256, Lp // 2), None, vc, self.bv, I(m.KH), I(kh), I(L), I(Lp // 16), label="attnT.pack")
+            if self.att2 == 2:
+                self.k("knorm", (-(-L // 256) * 256,), (256,), kc, I(m.KH), I(kh), I(L), self.KN, label="attnT.pack")
+                self.k("rowoff", (Mp,), (256,), self.Q, kc, self.KN, I(m.NH), I(m.KH), I(kh), I(L), I(pos0), I(R), self.OFF, label="attnT.pack")
+                ke = cl.Kernel(self.gp, "qke"); ke.set_args(self.aq, self.bk, I(Lp), I(256), *ra, self.OFF, self.ap, self.PS)
+                e = cl.enqueue_nd_range_kernel(m.q, ke, (Lp // self.TC * nsg * 8, Mp // self.TR), (nsg * 8, 1))
+                if m.prof:
+                    self.ev.append(("attnT.qke", e))
+                cl.enqueue_fill_buffer(m.q, self.FLAG, np.int32(0), 0, 4)
+                self.k("rowsum", (Mp,), (256,), self.PS, I(Lp // 32), I(R), self.G, self.FLAG, label="attnT.pack")
+                gate = self.FLAG
+            else:
+                gate = self.ONE
+            if self.att2:
+                ks = cl.Kernel(self.gpx, "qkstat"); ks.set_args(self.aq, self.bk, I(Lp), I(256), *ra, self.MX, self.INV, gate, self.G)
+                e = cl.enqueue_nd_range_kernel(m.q, ks, (nsg * 8, Mp // self.TR), (nsg * 8, 1))
+                if m.prof:
+                    self.ev.append(("attnT.stat", e))
+                kp = cl.Kernel(self.gpx, "qkp"); kp.set_args(self.aq, self.bk, I(Lp), I(256), *ra, self.MX, self.INV, self.ap, gate)
+                e = cl.enqueue_nd_range_kernel(m.q, kp, (Lp // self.TC * nsg * 8, Mp // self.TR), (nsg * 8, 1))
+                if m.prof:
+                    self.ev.append(("attnT.qkp", e))
+            else:
+                self.kg.set_args(self.aq, self.bk, self.Sm, I(R), I(Lp), I(256), I(Lp), I(0))
+                e = cl.enqueue_nd_range_kernel(m.q, self.kg, (Lp // self.TC * nsg * 8, Mp // self.TR), (nsg * 8, 1))
+                if m.prof:
+                    self.ev.append(("attnT.qk", e))
+                self.k("softP", (Mp * 256,), (256,), self.Sm, I(Lp), self.ap, I(pos0), I(R), label="attnT.soft")
             self.kg.set_args(self.ap, self.bv, self.ot, I(R), I(256), I(Lp), I(256), I(0))
             e = cl.enqueue_nd_range_kernel(m.q, self.kg, (256 // self.TC * nsg * 8, Mp // self.TR), (nsg * 8, 1))
             if m.prof:
-                self.ev.append(("attnT", e))
-            self.k("gateO", (256, R), None, self.ot, self.P, I(NPl), self.A, I(m.NH), I(kh), label="attnT")
+                self.ev.append(("attnT.pv", e))
+            if self.att2:
+                self.k("gateO2", (256, R), None, self.ot, self.G, self.P, I(NPl), self.A, I(m.NH), I(kh), label="attnT.gate")
+            else:
+                self.k("gateO", (256, R), None, self.ot, self.P, I(NPl), self.A, I(m.NH), I(kh), label="attnT.gate")
 
     def run_long(self, N, mtp=False, start=0, cuts=(), on_cut=None):
         """Feeds ids[start:N] in chunks (state and KV before `start` must already be in place). With mtp=True the MTP KV

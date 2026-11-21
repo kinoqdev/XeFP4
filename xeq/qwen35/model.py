@@ -15,6 +15,20 @@ from .. import device as K2
 from ..device import knob
 
 SRC = r"""
+#ifdef KV16
+#define KT half
+#define KLD16(o, p) vload_half16(o, p)
+#define KLD4(o, p) vload_half4(o, p)
+#define KLD1(o, p) vload_half(o, p)
+#define KST(v, o, p) vstore_half(v, o, p)
+#else
+#define KT float
+#define KLD16(o, p) vload16(o, p)
+#define KLD4(o, p) vload4(o, p)
+#define KLD1(o, p) ((p)[o])
+#define KST(v, o, p) ((p)[o] = (v))
+#endif
+
 #ifdef COND
 #define CARGS , __global const int* cf, int cw
 #define CCHECK if (cw >= 0 && cf[0] != cw) return;
@@ -196,58 +210,59 @@ __kernel void argmax2(__global const float* pv, __global const int* pi, int P, _
     if (l == 0) { tok[0] = ri[0]; outs[step] = ri[0]; }
 }
 inline float dot16(float16 a, float16 b) { return dot(a.lo.lo, b.lo.lo) + dot(a.lo.hi, b.lo.hi) + dot(a.hi.lo, b.hi.lo) + dot(a.hi.hi, b.hi.hi); }
+#ifndef QPG
+#define QPG 4                // query heads per KV head (Qwen3.5-9B: 4, Qwen3.8-27B: 6); fattn1/fattn2 run 32*QPG threads
+#endif
 __attribute__((intel_reqd_sub_group_size(16)))
-__kernel void fattn(__global const float* Q, __global const float* kc, __global const float* vc, __global float* PM, __global float* PL, __global float* PO,
+__kernel void fattn(__global const float* Q, __global const KT* kc, __global const KT* vc, __global float* PM, __global float* PL, __global float* PO,
                     int pos0, int KH, int S, int CH PARGS CARGS) {
     CCHECK
-    __local float sm[8][4], sl[8][4], so[8][4][256];
+    __local float sm[8][QPG], sl[8][QPG], so[8][QPG][256];
     int kh = get_group_id(0), s = get_group_id(1), t = get_group_id(2);
     int sg = get_sub_group_id(), l = get_sub_group_local_id(), NSG = get_num_sub_groups();
     int L = PADJ(pos0) + t + 1, j0 = s * CH;
     if (j0 >= L) return;
-    int j1 = min(L, j0 + CH), NH = KH * 4;
-    float16 q0 = vload16(0, Q + ((size_t)t * NH + kh * 4 + 0) * 256 + l * 16), q1 = vload16(0, Q + ((size_t)t * NH + kh * 4 + 1) * 256 + l * 16);
-    float16 q2 = vload16(0, Q + ((size_t)t * NH + kh * 4 + 2) * 256 + l * 16), q3 = vload16(0, Q + ((size_t)t * NH + kh * 4 + 3) * 256 + l * 16);
-    float m0 = -INFINITY, m1 = -INFINITY, m2 = -INFINITY, m3 = -INFINITY, s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
-    float16 o0 = (float16)(0.0f), o1 = (float16)(0.0f), o2 = (float16)(0.0f), o3 = (float16)(0.0f);
+    int j1 = min(L, j0 + CH), NH = KH * QPG;
+    float16 q[QPG], o[QPG]; float mx[QPG], su[QPG];
+    UNR for (int g = 0; g < QPG; g++) { q[g] = vload16(0, Q + ((size_t)t * NH + kh * QPG + g) * 256 + l * 16); mx[g] = -INFINITY; su[g] = 0.0f; o[g] = (float16)(0.0f); }
     for (int j = j0 + sg; j < j1; j += NSG) {
         size_t r = ((size_t)j * KH + kh) * 256 + l * 16;
-        float16 kv = vload16(0, kc + r), vv = vload16(0, vc + r);
-        float c0 = sub_group_reduce_add(dot16(q0, kv)) * 0.0625f, c1 = sub_group_reduce_add(dot16(q1, kv)) * 0.0625f;
-        float c2 = sub_group_reduce_add(dot16(q2, kv)) * 0.0625f, c3 = sub_group_reduce_add(dot16(q3, kv)) * 0.0625f;
+        float16 kv = KLD16(0, kc + r), vv = KLD16(0, vc + r);
 #define ONL(m_, s_, o_, c_) { float mn = fmax(m_, c_), a = exp(m_ - mn), b = exp(c_ - mn); s_ = s_ * a + b; o_ = o_ * a + vv * b; m_ = mn; }
-        ONL(m0, s0, o0, c0) ONL(m1, s1, o1, c1) ONL(m2, s2, o2, c2) ONL(m3, s3, o3, c3)
+        UNR for (int g = 0; g < QPG; g++) { float c = sub_group_reduce_add(dot16(q[g], kv)) * 0.0625f; ONL(mx[g], su[g], o[g], c) }
     }
-    if (l == 0) { sm[sg][0] = m0; sm[sg][1] = m1; sm[sg][2] = m2; sm[sg][3] = m3; sl[sg][0] = s0; sl[sg][1] = s1; sl[sg][2] = s2; sl[sg][3] = s3; }
-    vstore16(o0, 0, &so[sg][0][l * 16]); vstore16(o1, 0, &so[sg][1][l * 16]); vstore16(o2, 0, &so[sg][2][l * 16]); vstore16(o3, 0, &so[sg][3][l * 16]);
+    if (l == 0) { UNR for (int g = 0; g < QPG; g++) { sm[sg][g] = mx[g]; sl[sg][g] = su[g]; } }
+    UNR for (int g = 0; g < QPG; g++) vstore16(o[g], 0, &so[sg][g][l * 16]);
     barrier(CLK_LOCAL_MEM_FENCE);
-    int lid = get_local_id(0);
-    int g = lid >> 5, d0 = (lid & 31) * 8;
-    float M = -INFINITY;
-    for (int i = 0; i < NSG; i++) M = fmax(M, sm[i][g]);
-    float tl = 0.0f; float8 ov = (float8)(0.0f);
-    for (int i = 0; i < NSG; i++) { float w = sm[i][g] == -INFINITY ? 0.0f : exp(sm[i][g] - M); tl += sl[i][g] * w; ov += vload8(0, &so[i][g][d0]) * w; }
-    size_t pb_ = (((size_t)t * KH + kh) * 4 + g) * S + s;
-    if ((lid & 31) == 0) { PM[pb_] = M; PL[pb_] = tl; }
-    vstore8(ov, 0, PO + pb_ * 256 + d0);
+    int lid = get_local_id(0), d0 = (lid & 31) * 8;
+    for (int g = lid >> 5; g < QPG; g += (int)(get_local_size(0) >> 5)) {
+        float M = -INFINITY;
+        for (int i = 0; i < NSG; i++) M = fmax(M, sm[i][g]);
+        float tl = 0.0f; float8 ov = (float8)(0.0f);
+        for (int i = 0; i < NSG; i++) { float w = sm[i][g] == -INFINITY ? 0.0f : exp(sm[i][g] - M); tl += sl[i][g] * w; ov += vload8(0, &so[i][g][d0]) * w; }
+        size_t pb_ = (((size_t)t * KH + kh) * QPG + g) * S + s;
+        if ((lid & 31) == 0) { PM[pb_] = M; PL[pb_] = tl; }
+        vstore8(ov, 0, PO + pb_ * 256 + d0);
+    }
 }
 __attribute__((intel_reqd_sub_group_size(16)))
-__kernel void fattn2(__global const float* Q, __global const float* kc, __global const float* vc, __global float* PM, __global float* PL, __global float* PO,
+__kernel void fattn2(__global const float* Q, __global const KT* kc, __global const KT* vc, __global float* PM, __global float* PL, __global float* PO,
                      int pos0, int KH, int S, int CH PARGS CARGS) {
+    // 2 tokens x QPG heads, one sub-group each: 32*QPG threads
     CCHECK
     __local float sk[16 * 256], sv[16 * 256];
-    int kh = get_group_id(0), s = get_group_id(1), sg = get_sub_group_id(), l = get_sub_group_local_id(), lid = get_local_id(0);
-    int t = sg >> 2, g = sg & 3, NH = KH * 4;
+    int kh = get_group_id(0), s = get_group_id(1), sg = get_sub_group_id(), l = get_sub_group_local_id(), lid = get_local_id(0), LS = get_local_size(0);
+    int t = sg / QPG, g = sg % QPG, NH = KH * QPG;
     int L0 = PADJ(pos0) + 1, Lt = L0 + t, j0 = s * CH;
     if (j0 >= L0 + 1) return;
     int jend = min(L0 + 1, j0 + CH);
-    float16 q = vload16(0, Q + ((size_t)t * NH + kh * 4 + g) * 256 + l * 16);
+    float16 q = vload16(0, Q + ((size_t)t * NH + kh * QPG + g) * 256 + l * 16);
     float m = -INFINITY, sm = 0.0f; float16 o = (float16)(0.0f);
     for (int jt = j0; jt < jend; jt += 16) {
-        UNR for (int i = 0; i < 8; i++) {
-            int e = lid + i * 128, pj = e >> 6, c = e & 63, j = jt + pj;
+        for (int e = lid; e < 1024; e += LS) {
+            int pj = e >> 6, c = e & 63, j = jt + pj;
             float4 kk = (float4)(0.0f), vv = (float4)(0.0f);
-            if (j < jend) { size_t r = ((size_t)j * KH + kh) * 256; kk = vload4(c, kc + r); vv = vload4(c, vc + r); }
+            if (j < jend) { size_t r = ((size_t)j * KH + kh) * 256; kk = KLD4(c, kc + r); vv = KLD4(c, vc + r); }
             vstore4(kk, e, sk); vstore4(vv, e, sv);
         }
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -261,27 +276,28 @@ __kernel void fattn2(__global const float* Q, __global const float* kc, __global
         }
         barrier(CLK_LOCAL_MEM_FENCE);
     }
-    size_t pb_ = (((size_t)t * KH + kh) * 4 + g) * S + s;
+    size_t pb_ = (((size_t)t * KH + kh) * QPG + g) * S + s;
     if (l == 0) { PM[pb_] = m; PL[pb_] = sm; }
     vstore16(o, 0, PO + pb_ * 256 + l * 16);
 }
 __attribute__((intel_reqd_sub_group_size(16)))
-__kernel void fattn1(__global const float* Q, __global const float* kc, __global const float* vc, __global float* PM, __global float* PL, __global float* PO,
+__kernel void fattn1(__global const float* Q, __global const KT* kc, __global const KT* vc, __global float* PM, __global float* PL, __global float* PO,
                      int pos0, int KH, int S, int CH PARGS CARGS) {
+    // 1 token: QPG heads x 2 key halves, one sub-group each: 32*QPG threads
     CCHECK
-    __local float sk[16 * 256], sv[16 * 256], cm[8], cs[8], co[8 * 256];
-    int kh = get_group_id(0), s = get_group_id(1), sg = get_sub_group_id(), l = get_sub_group_local_id(), lid = get_local_id(0);
-    int g = sg & 3, hf = sg >> 2;
+    __local float sk[16 * 256], sv[16 * 256], cm[2 * QPG], cs[2 * QPG], co[2 * QPG * 256];
+    int kh = get_group_id(0), s = get_group_id(1), sg = get_sub_group_id(), l = get_sub_group_local_id(), lid = get_local_id(0), LS = get_local_size(0);
+    int g = sg % QPG, hf = sg / QPG;
     int L = PADJ(pos0) + 1, j0 = s * CH;
     if (j0 >= L) return;
     int jend = min(L, j0 + CH);
-    float16 q = vload16(0, Q + ((size_t)kh * 4 + g) * 256 + l * 16);
+    float16 q = vload16(0, Q + ((size_t)kh * QPG + g) * 256 + l * 16);
     float m = -INFINITY, sm = 0.0f; float16 o = (float16)(0.0f);
     for (int jt = j0; jt < jend; jt += 16) {
-        UNR for (int i = 0; i < 8; i++) {
-            int e = lid + i * 128, pj = e >> 6, c = e & 63, j = jt + pj;
+        for (int e = lid; e < 1024; e += LS) {
+            int pj = e >> 6, c = e & 63, j = jt + pj;
             float4 kk = (float4)(0.0f), vv = (float4)(0.0f);
-            if (j < jend) { size_t r = ((size_t)j * KH + kh) * 256; kk = vload4(c, kc + r); vv = vload4(c, vc + r); }
+            if (j < jend) { size_t r = ((size_t)j * KH + kh) * 256; kk = KLD4(c, kc + r); vv = KLD4(c, vc + r); }
             vstore4(kk, e, sk); vstore4(vv, e, sv);
         }
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -297,10 +313,10 @@ __kernel void fattn1(__global const float* Q, __global const float* kc, __global
     vstore16(o, 0, co + sg * 256 + l * 16);
     barrier(CLK_LOCAL_MEM_FENCE);
     if (hf == 0) {
-        float m2 = cm[sg + 4], s2 = cs[sg + 4]; float16 o2 = vload16(0, co + (sg + 4) * 256 + l * 16);
+        float m2 = cm[sg + QPG], s2 = cs[sg + QPG]; float16 o2 = vload16(0, co + (sg + QPG) * 256 + l * 16);
         float M = fmax(m, m2), wa = m == -INFINITY ? 0.0f : exp(m - M), wb = m2 == -INFINITY ? 0.0f : exp(m2 - M);
         sm = sm * wa + s2 * wb; o = o * wa + o2 * wb;
-        size_t pb_ = ((size_t)kh * 4 + g) * S + s;
+        size_t pb_ = ((size_t)kh * QPG + g) * S + s;
         if (l == 0) { PM[pb_] = M; PL[pb_] = sm; }
         vstore16(o, 0, PO + pb_ * 256 + l * 16);
     }
@@ -308,9 +324,9 @@ __kernel void fattn1(__global const float* Q, __global const float* kc, __global
 __kernel void fcomb(__global const float* PM, __global const float* PL, __global const float* PO, __global const float* P, int ldp, __global float* A,
                     int pos0, int KH, int S, int CH PARGS CARGS) {
     CCHECK
-    int h = get_group_id(0), t = get_group_id(1), d = get_local_id(0), NH = KH * 4, kh = h / 4, g = h % 4;
+    int h = get_group_id(0), t = get_group_id(1), d = get_local_id(0), NH = KH * QPG, kh = h / QPG, g = h % QPG;
     int L = PADJ(pos0) + t + 1, ns = (L + CH - 1) / CH;
-    size_t base = (((size_t)t * KH + kh) * 4 + g) * S;
+    size_t base = (((size_t)t * KH + kh) * QPG + g) * S;
     float M = -INFINITY;
     for (int s = 0; s < ns; s++) M = fmax(M, PM[base + s]);
     float tl = 0.0f, o = 0.0f;
@@ -351,7 +367,7 @@ __kernel void dnet(__global const float* qkv, __global const float* p, __global 
     float ms = wsum(o * o, r) / 128.0f; float z = p[ZO + h * 128 + d];
     out[h * 128 + d] = o * rsqrt(ms + eps) * (gplus1 ? 1.0f + gw[d] : gw[d]) * silu(z);
 }
-__kernel void attn_prep(__global const float* p, __global const float* qn, __global const float* kn, __global float* q, __global float* kc, __global float* vc,
+__kernel void attn_prep(__global const float* p, __global const float* qn, __global const float* kn, __global float* q, __global KT* kc, __global KT* vc,
                         int pos, float theta, int NH, int KH, int RD, float eps, int plus1 PARGS CARGS) {
     CCHECK
     __local float r[256], sh[256];
@@ -369,9 +385,9 @@ __kernel void attn_prep(__global const float* p, __global const float* qn, __glo
         y = d < hr ? sh[d] * c - sh[d + hr] * s : sh[d] * c + sh[d - hr] * s;
     }
     if (g < NH) q[g * 256 + d] = y;
-    else { size_t o = ((size_t)PADJ(pos) * KH + (g - NH)) * 256 + d; kc[o] = y; vc[o] = p[NH * 512 + KH * 256 + (g - NH) * 256 + d]; }
+    else { size_t o = ((size_t)PADJ(pos) * KH + (g - NH)) * 256 + d; KST(y, o, kc); KST(p[NH * 512 + KH * 256 + (g - NH) * 256 + d], o, vc); }
 }
-__kernel void attn(__global const float* q, __global const float* kc, __global const float* vc, __global const float* p, __global float* out,
+__kernel void attn(__global const float* q, __global const KT* kc, __global const KT* vc, __global const float* p, __global float* out,
                    __global float* sc, int T, int TM, int KH, int GQ PARGS CARGS) {
     CCHECK
     __local float sq[256], r[256];
@@ -379,8 +395,8 @@ __kernel void attn(__global const float* q, __global const float* kc, __global c
     sq[l] = q[h * 256 + l]; barrier(CLK_LOCAL_MEM_FENCE);
     float mx = -INFINITY;
     for (int t = l; t < PADJ(T); t += 256) {
-        __global const float* kr = kc + ((size_t)t * KH + kh) * 256; float s = 0.0f;
-        for (int i = 0; i < 256; i += 4) s += dot(vload4(0, sq + i), vload4(0, kr + i));
+        __global const KT* kr = kc + ((size_t)t * KH + kh) * 256; float s = 0.0f;
+        for (int i = 0; i < 256; i += 4) s += dot(vload4(0, sq + i), KLD4(0, kr + i));
         s *= 0.0625f; sc[h * TM + t] = s; mx = fmax(mx, s);
     }
     mx = wmax(mx, r); float sum = 0.0f;
@@ -388,7 +404,7 @@ __kernel void attn(__global const float* q, __global const float* kc, __global c
     sum = wsum(sum, r);
     barrier(CLK_GLOBAL_MEM_FENCE);
     float o = 0.0f;
-    for (int t = 0; t < PADJ(T); t++) o += sc[h * TM + t] * vc[((size_t)t * KH + kh) * 256 + l];
+    for (int t = 0; t < PADJ(T); t++) o += sc[h * TM + t] * KLD1(((size_t)t * KH + kh) * 256 + l, vc);
     float gt = p[h * 512 + 256 + l];
     out[h * 256 + l] = o / sum / (1.0f + exp(-gt));
 }
@@ -534,6 +550,10 @@ class Model:
         self.prof = prof; self.ev = []; self.lab = {}
         self.q = cl.CommandQueue(self.ctx, properties=cl.command_queue_properties.PROFILING_ENABLE) if prof else cl.CommandQueue(self.ctx)
         opt = [f"-DG={meta['G']}", f"-DXE8={int(meta['fmt'] == 'xe8')}", f"-DDB={int(knob('Q35_DB', '64'))}", f"-DNP={self.np_}"]
+        self.GQ = self.NH // self.KH; self.ALS = 32 * self.GQ               # query heads per KV head; fattn1/fattn2 work-group size
+        opt += [f"-DQPG={self.GQ}"]
+        self.kv16 = int(knob("Q35_KV16", "1")); self.KVB = 2 if self.kv16 else 4      # KV cache element: FP16 (default) or FP32
+        opt += ["-DKV16"] if self.kv16 else []
         self.rmap = {"proj": 1, "out": 1, "gu": 2 if meta["G"] == 32 else 1, "down": 1, "lm_head": 2} if gv[1] == 0 else {k: gv[1] for k in ("proj", "out", "gu", "down", "lm_head")}
         self.prgs = {r: cl.Program(self.ctx, SRC).build(options=opt + [f"-DR={r}"]) for r in sorted(set(self.rmap.values()))}
         self.prg = self.prgs[min(self.prgs)]
@@ -563,7 +583,7 @@ class Model:
             if lt == "linear_attention":
                 self.state[i] = (f32(3 * (2 * self.KD + self.VH * 128)), f32(self.VH * 128 * 128), f32(self.VH * 128), f32(self.VH * 128), f32(self.VH))
             else:
-                self.state[i] = (f32(tmax * self.KH * 256), f32(tmax * self.KH * 256))
+                self.state[i] = tuple(cl.Buffer(self.ctx, mf.READ_WRITE, tmax * self.KH * 256 * self.KVB) for _ in range(2))
         self.build()
 
     def reset(self):
@@ -599,6 +619,10 @@ class Model:
         R = self.rmap["lm_head"]
         return self.K("gemv_i8r", (16, -(-(self.V // R) // W) * W), (16, W), self.buf["lm_head.q"], self.buf["lm_head.s"], self.t, self.logit, np.int32(self.V), np.int32(self.H), label="lm_head", prg=self.prgs[R])
 
+    def _fls(self):
+        """Work-group size of the single-token attention kernel (fattn1: 32 * QPG, fattn: 128)."""
+        return self.ALS if self.fa1 == "fattn1" else 128
+
     def build(self):
         c, H, F, I = self.cfg, self.H, self.F, np.int32
         eps = np.float32(self.eps)
@@ -630,7 +654,7 @@ class Model:
                 kp = self.K("attn_prep", ((self.NH + self.KH) * 256,), (256,), self.P, self.buf[p + "q_norm"], self.buf[p + "k_norm"], self.Q, kc, vc,
                             I(0), np.float32(self.theta), I(self.NH), I(self.KH), I(self.RD), eps, I(self.qp1))
                 if self.fa:
-                    ka1 = list(self.K(self.fa1, (self.KH * 128, 1, 1), (128, 1, 1), self.Q, kc, vc, self.PM, self.PL, self.PO, I(0), I(self.KH), I(self.SM), I(self.CH)))
+                    ka1 = list(self.K(self.fa1, (self.KH * self._fls(), 1, 1), (self._fls(), 1, 1), self.Q, kc, vc, self.PM, self.PL, self.PO, I(0), I(self.KH), I(self.SM), I(self.CH)))
                     ka2 = self.K("fcomb", (self.NH * 256, 1), (256, 1), self.PM, self.PL, self.PO, self.P, I(0), self.a, I(0), I(self.KH), I(self.SM), I(self.CH))
                     ks += [kp, ka1, ka2]; posk = [kp, ka1, ka2]
                 else:
@@ -661,7 +685,7 @@ class Model:
         H, F, I, eps = self.H, self.F, np.int32, np.float32(self.eps)
         f32 = lambda n: cl.Buffer(self.ctx, mf.READ_WRITE, int(n) * 4)
         self.mE, self.mcat, self.mh = f32(H), f32(2 * H), f32(H)
-        self.mkc, self.mvc = f32(self.TM * self.KH * 256), f32(self.TM * self.KH * 256)
+        self.mkc, self.mvc = (cl.Buffer(self.ctx, mf.READ_WRITE, self.TM * self.KH * 256 * self.KVB) for _ in range(2))
         self.mtok, self.mouts = f32(1), f32(self.TM)
         first, second = (self.mcat.get_sub_region(0, H * 4), self.mcat.get_sub_region(H * 4, H * 4))
         self._keep = (first, second)
@@ -706,7 +730,7 @@ class Model:
             if posk:
                 posk[0][0].set_arg(6, np.int32(pos))
                 if len(posk) == 3:
-                    posk[1][0].set_arg(6, np.int32(pos)); posk[1][1] = (self.KH * 128, -(-(pos + 1) // self.CH), 1); posk[2][0].set_arg(6, np.int32(pos))
+                    posk[1][0].set_arg(6, np.int32(pos)); posk[1][1] = (self.KH * self._fls(), -(-(pos + 1) // self.CH), 1); posk[2][0].set_arg(6, np.int32(pos))
                 else:
                     posk[1][0].set_arg(6, np.int32(pos + 1))
             self.run(ks)

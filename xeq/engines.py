@@ -51,20 +51,20 @@ def find(path):
 
 
 def open_model(path, ctx=None, mtp=True, vision=False, kv=None):
-    """-> (engine, Chat). kv: "fp16" (default) or "fp32" KV cache (Gemma 4; fixed when the kernels are first built)."""
+    """-> (engine, Chat). kv: "fp16" (default) or "fp32" KV cache (both families; fixed when the kernels are first built)."""
     import sys
     from .chat import Chat
     f = find(path)
     if kv not in (None, "fp32", "fp16"):
         raise SystemExit(f"--kv must be fp32 or fp16, not {kv!r}")
-    if kv == "fp16" and f["family"] != "gemma4":
-        print("[xeq] note: --kv fp16 applies to Gemma 4 only; Qwen3.5 keeps an FP32 KV cache", file=sys.stderr, flush=True)
     if f["family"] == "gemma4" and kv:
         want = "1" if kv == "fp16" else "0"
         mod = sys.modules.get(__package__ + ".gemma4.model")
         if mod is not None and int(mod.KV16) != int(want):
             raise SystemExit("the KV cache type is fixed once a Gemma model has been loaded in this process")
         os.environ["XEQ_G4_KV16"] = want
+    if f["family"] == "qwen35" and kv:
+        os.environ["XEQ_Q35_KV16"] = "1" if kv == "fp16" else "0"       # read per model (qwen35.model.Model)
     chat = Chat(f["folder"], f["family"])
     if f["family"] == "gemma4":
         eng = Gemma(f["main"], chat.stop, ctx, f["vision"] if vision else None, f["assistant"] if mtp else None)
@@ -87,6 +87,41 @@ def _check_vram(eng):
 
 def _rd(m, buf, n):
     v = np.zeros(n, np.int32); cl.enqueue_copy(m.q, v, buf); m.q.finish(); return v.tolist()
+
+
+class _Side:
+    """Keeps the chat cache of a long conversation while a short unrelated request runs (chat UIs and coding agents send
+    title / tag / follow-up requests between turns; each used to replace the cache, so the next turn processed its whole
+    prompt again). Positions [0, B) of every position-indexed cache buffer are copied aside before the short request and
+    copied back after it; the short request starts from a cleared [0, B) as from an empty cache.
+    knobs: XEQ_SIDE_TOKENS (B, default 1024; 0 = off), XEQ_SIDE_MIN (cached length that is worth keeping, default 1024)."""
+
+    def __init__(self, m, bufs):
+        from .device import knob
+        self.m, self.bufs = m, bufs                       # [(buffer, bytes per position, positions)]
+        self.B = int(knob("SIDE_TOKENS", "1024")); self.min = int(knob("SIDE_MIN", "1024")); self.bk = None
+
+    def wanted(self, cached, shared, need):
+        return self.B > 0 and cached >= self.min and shared < SHORT and need <= self.B
+
+    def _n(self, sb, cap):
+        return min(self.B, cap) * sb
+
+    def save(self):
+        m, mf = self.m, cl.mem_flags
+        if self.bk is None:                               # allocated on first use only
+            self.bk = [cl.Buffer(m.ctx, mf.READ_WRITE, self._n(sb, cap)) for _, sb, cap in self.bufs]
+        for (b, sb, cap), k in zip(self.bufs, self.bk):
+            cl.enqueue_copy(m.q, k, b, byte_count=self._n(sb, cap))
+
+    def clear(self):
+        for b, sb, cap in self.bufs:
+            cl.enqueue_fill_buffer(self.m.q, b, np.uint32(0), 0, self._n(sb, cap))
+
+    def restore(self):
+        for (b, sb, cap), k in zip(self.bufs, self.bk):
+            cl.enqueue_copy(self.m.q, b, k, byte_count=self._n(sb, cap))
+        self.m.q.finish()
 
 
 def _cut(got, stop):
@@ -130,6 +165,13 @@ class _Sampled:
         self._sopt = sampling; self._splans = {}
         if not sampling:
             return self._generate(ids, mx, on_tokens, **kw)
+        if getattr(self, "spn", False) and self.sp is not None:                                # multi-draft MTP is greedy only: sample without MTP
+            with self.lock:
+                sp, self.sp = self.sp, None
+                try:
+                    return self.generate(ids, mx, on_tokens, sampling, **kw)
+                finally:
+                    self.sp = sp
         from .sampling import Sampler
         with self.lock:
             if self.sampler is None:
@@ -152,6 +194,7 @@ class Gemma(_Sampled):
         from .device import knob as _knob
         self.exact = int(_knob("G4_CACHE_EXACT", "1"))
         self.CAPS = min(L["CAP"] for L in self.m.lcfg if not L["kv"]); self.WIN = self.m.WIN
+        self.side = _Side(self.m, [(b, b.size // L["CAP"], L["CAP"]) for L, kv in zip(self.m.lcfg, self.m.kv) for b in kv])
         self.vis = None
         if vision:
             from .gemma4.vision import Vision
@@ -195,6 +238,9 @@ class Gemma(_Sampled):
             c = self.cache if (reuse and not spans) else []; P = 0
             while P < min(len(c), N) and c[P] == ids[P]:
                 P += 1
+            side = reuse and not spans and self.side.wanted(len(c), P, N + 8 + (self.MT.TB if use_mtp else 0))
+            if side:                                                         # short unrelated request: keep the cache (see _Side)
+                self.side.save(); keep = (self.cache, self.plen); c, P = [], 0
             P = min(P, N - 1); E = len(c) + (8 if c else 0)                  # MTP may have written a few positions past the cache
             if self.exact:
                 P = min(P, self.plen)
@@ -206,7 +252,7 @@ class Gemma(_Sampled):
                 s = max(0, P - self.CAPS)
             self.cache = []
             if s == 0:
-                m.reset()
+                self.side.clear() if side else m.reset()
             if spans:
                 self.pf.set_images(spans, soft)
             m.load_ids(np.array(list(ids) + [0] * 8, np.int32))
@@ -219,6 +265,8 @@ class Gemma(_Sampled):
             t2 = time.perf_counter()
             if spans:
                 self.pf.set_images([])
+            elif side and N + len(got) + 8 + (self.MT.TB if use_mtp else 0) <= self.side.B:
+                self.side.restore(); self.cache, self.plen = keep           # the conversation's cache is back
             else:
                 self.cache = list(ids) + got[:j - 1]; self.plen = N
         out, hit = _cut(got, self.stop)
@@ -378,13 +426,22 @@ class Qwen(_Sampled):
         from .qwen35.model import Model
         from .qwen35.prefill import Prefill
         self.m = Model(path, tmax=ctx); self.pf = Prefill(self.m); self.lock = threading.RLock(); self.stop = stop
-        self.sp = None
+        self.sp = None; self.spn = False
         if mtp:
-            from .qwen35.spec import Spec
-            self.sp = Spec(self.m, mtp)
+            from .device import knob as _kn
+            nd = int(_kn("Q35_MTPN", "2"))                       # MTP drafts per verify pass (1: spec.Spec)
+            if nd > 1:
+                from .qwen35.specn import SpecN
+                self.sp = SpecN(self.m, mtp, nd); self.spn = True
+            else:
+                from .qwen35.spec import Spec
+                self.sp = Spec(self.m, mtp)
         from .device import knob
         self.nsnap = int(knob("Q35_SNAPS", "4"))               # chat cache: linear-attention state snapshots kept
         self.snaps, self.pool, self.cids = [], [], []
+        m = self.m; kvp = m.KH * 256 * m.KVB
+        self.side = _Side(m, [(b, kvp, m.TM) for i in sorted(m.state) if len(m.state[i]) == 2 for b in m.state[i]] +
+                          [(b, kvp, m.TM) for b in (getattr(m, "mkc", None), getattr(m, "mvc", None)) if b is not None])
 
     @property
     def ctx(self):
@@ -439,32 +496,60 @@ class Qwen(_Sampled):
             raise ValueError(f"prompt too long ({N} tokens, limit {m.TM - 25})")
         with self.lock:
             t0 = time.perf_counter()
-            s = self._resume(ids, reuse); self.cids = []
-            cuts = [p for p in (N - 64, N) if p > s and p >= SHORT] if self.nsnap > 0 else []
-            fast = s > 0 or N >= SHORT
-            if self.sp is not None:
-                y0 = self.sp.prompt_fast(ids, self.pf, start=s, cuts=cuts, on_cut=self._save) if fast else self.sp.prompt(ids)
-                got = [y0]; t1 = time.perf_counter(); done = y0 in self.stop
-                if on_tokens and not done:
-                    on_tokens(got)
-                while not done and len(got) < mx:
-                    self.sp.iterate(step); out, _ = self.sp.read(); got = [y0] + out
-                    done = any(t in self.stop for t in got)
-                    if on_tokens:
-                        on_tokens(_cut(got, self.stop)[0][:mx])
-                got = got[:mx]
+            c = self.cids if reuse else []; P = 0
+            while P < min(len(c), N) and c[P] == ids[P]:
+                P += 1
+            side = reuse and self.side.wanted(len(c), P, N + 16)
+            if side:                                                         # short unrelated request: keep the cache (see _Side)
+                self.side.save(); keep = (self.snaps, self.cids); self.snaps, self.cids = [], []
+                full_reset = m.reset
+
+                def part_reset():
+                    for i in self.m.state:
+                        if len(self.m.state[i]) == 5:
+                            for x in self.m.state[i]:
+                                cl.enqueue_fill_buffer(self.m.q, x, np.float32(0), 0, x.size)
+                    self.side.clear(); self.m.q.finish()
+                m.reset = part_reset
+            try:
+                return self._gen(ids, mx, on_tokens, step, reuse, side, t0, keep if side else None)
+            finally:
+                if side:
+                    m.reset = full_reset
+
+    def _gen(self, ids, mx, on_tokens, step, reuse, side, t0, keep):
+        m = self.m; N = len(ids)
+        s = self._resume(ids, reuse); self.cids = []
+        cuts = [p for p in (N - 64, N) if p > s and p >= SHORT] if self.nsnap > 0 else []
+        fast = s > 0 or N >= SHORT
+        if self.sp is not None:
+            y0 = self.sp.prompt_fast(ids, self.pf, start=s, cuts=cuts, on_cut=self._save) if fast else self.sp.prompt(ids)
+            got = [y0]; t1 = time.perf_counter(); done = y0 in self.stop
+            if on_tokens and not done:
+                on_tokens(got)
+            while not done and len(got) < mx:
+                self.sp.iterate(step); out, _ = self.sp.read(); got = [y0] + out
+                done = any(t in self.stop for t in got)
+                if on_tokens:
+                    on_tokens(_cut(got, self.stop)[0][:mx])
+            got = got[:mx]
+        else:
+            if s == 0:
+                m.reset()
+            if not fast:
+                m.load_ids(ids)
+                for i in range(N):
+                    m.step(i, out_step=0 if i == N - 1 else None, feed=i)
             else:
-                if s == 0:
-                    m.reset()
-                if not fast:
-                    m.load_ids(ids)
-                    for i in range(N):
-                        m.step(i, out_step=0 if i == N - 1 else None, feed=i)
-                else:
-                    m.load_ids(list(ids) + [0]); self.pf.run_long(N, start=s, cuts=cuts, on_cut=self._save); self.pf.first_token(0)
-                got = _rd(m, m.outs, 1); t1 = time.perf_counter()
-                got, _ = _decode(m, N, got, mx, self.stop, on_tokens, 4)
-            m.q.finish(); t2 = time.perf_counter()
+                m.load_ids(list(ids) + [0]); self.pf.run_long(N, start=s, cuts=cuts, on_cut=self._save); self.pf.first_token(0)
+            got = _rd(m, m.outs, 1); t1 = time.perf_counter()
+            got, _ = _decode(m, N, got, mx, self.stop, on_tokens, 4)
+        m.q.finish(); t2 = time.perf_counter()
+        if side and N + len(got) + 16 <= self.side.B:
+            self.side.restore(); self.pool += [x[1] for x in self.snaps]; self.snaps, self.cids = keep   # the conversation's cache is back
+        else:
+            if side:                                                     # ran past B: the set-aside snapshots are stale
+                self.pool += [x[1] for x in keep[0]]
             self._trim(); self.cids = list(ids) + list(got)
         out, hit = _cut(got, self.stop)
         return out, "stop" if hit else "length", (t1 - t0, t2 - t1, len(out), N - s)
